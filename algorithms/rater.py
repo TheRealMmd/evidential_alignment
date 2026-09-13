@@ -1,6 +1,10 @@
 import os
 import csv
 
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -213,6 +217,22 @@ class Rater(Algorithm):
         )
         self.rater_capacity = getattr(
             self.config, "rater_capacity", "medium"
+        )
+
+        # ----------------------------------------------------
+        # Diagnostic plotting. By default, plots are saved at
+        # the same frequency as --eval_freq. If config.py later
+        # defines --rater_plot_freq, it will override eval_freq.
+        # ----------------------------------------------------
+        self.plot_freq = int(
+            getattr(
+                self.config,
+                "rater_plot_freq",
+                max(1, int(getattr(self.config, "eval_freq", 1))),
+            )
+        )
+        self.save_plot_data = bool(
+            getattr(self.config, "rater_save_plot_data", True)
         )
 
         # ----------------------------------------------------
@@ -661,11 +681,17 @@ class Rater(Algorithm):
     @torch.no_grad()
     def _score_loss_relationship(self, dataset, models=None):
         """
-        Similar to the user's previous rater-evaluation script:
-        compare raw rater scores with per-example classifier loss.
+        Compare raw rater score with per-example classifier loss.
 
-        The reported loss for each example is averaged across the supplied
-        inner-model population.
+        For each embedding we compute:
+          * raw rater score r_eta(z);
+          * CE loss for every inner model;
+          * mean CE loss across the inner-model population;
+          * mean correctness across the population;
+          * Waterbirds group / label / attribute.
+
+        Raw rater score is plotted rather than a global softmax weight because
+        the actual softmax weight used by the inner loop is batch-dependent.
         """
 
         if models is None:
@@ -686,10 +712,13 @@ class Rater(Algorithm):
         all_scores = []
         all_losses = []
         all_correct = []
+        all_groups = []
+        all_labels = []
+        all_attrs = []
 
-        for z, y, _, _ in loader:
+        for z, y, g, a in loader:
             z = z.to(self.device, non_blocking=True)
-            y = y.to(self.device, non_blocking=True)
+            y_device = y.to(self.device, non_blocking=True)
 
             scores = self.rater(z)
             model_losses = []
@@ -699,32 +728,54 @@ class Rater(Algorithm):
                 logits = model(z)
                 per_loss = F.cross_entropy(
                     logits,
-                    y,
+                    y_device,
                     reduction="none",
                 )
-                correct = (logits.argmax(dim=1) == y).float()
+                correct = (
+                    logits.argmax(dim=1) == y_device
+                ).float()
+
                 model_losses.append(per_loss)
                 model_correct.append(correct)
 
-            mean_loss = torch.stack(model_losses, dim=0).mean(dim=0)
-            mean_correct = torch.stack(model_correct, dim=0).mean(dim=0)
+            mean_loss = torch.stack(
+                model_losses,
+                dim=0,
+            ).mean(dim=0)
+
+            mean_correct = torch.stack(
+                model_correct,
+                dim=0,
+            ).mean(dim=0)
 
             all_scores.append(scores.cpu())
             all_losses.append(mean_loss.cpu())
             all_correct.append(mean_correct.cpu())
+            all_groups.append(g.cpu())
+            all_labels.append(y.cpu())
+            all_attrs.append(a.cpu())
 
         scores = torch.cat(all_scores).numpy()
         losses = torch.cat(all_losses).numpy()
         correctness = torch.cat(all_correct).numpy()
+        groups = torch.cat(all_groups).numpy()
+        labels = torch.cat(all_labels).numpy()
+        attrs = torch.cat(all_attrs).numpy()
 
         if (
             len(scores) >= 2
             and np.std(scores) > 0
             and np.std(losses) > 0
         ):
-            spearman_loss = float(stats.spearmanr(scores, losses).statistic)
+            spearman_loss = float(
+                stats.spearmanr(scores, losses).statistic
+            )
+            pearson_loss = float(
+                stats.pearsonr(scores, losses).statistic
+            )
         else:
             spearman_loss = 0.0
+            pearson_loss = 0.0
 
         if (
             len(scores) >= 2
@@ -732,7 +783,10 @@ class Rater(Algorithm):
             and np.std(correctness) > 0
         ):
             spearman_correct = float(
-                stats.spearmanr(scores, correctness).statistic
+                stats.spearmanr(
+                    scores,
+                    correctness,
+                ).statistic
             )
         else:
             spearman_correct = 0.0
@@ -741,7 +795,257 @@ class Rater(Algorithm):
             "scores": scores,
             "mean_loss": losses,
             "mean_correctness": correctness,
+            "groups": groups,
+            "labels": labels,
+            "attrs": attrs,
             "spearman_score_vs_loss": spearman_loss,
+            "pearson_score_vs_loss": pearson_loss,
+            "spearman_score_vs_correctness": spearman_correct,
+        }
+
+    def _group_display_name(self, gid):
+        """Readable group labels for Waterbirds; generic labels otherwise."""
+
+        if self.config.dataset == "waterbirds":
+            names = {
+                0: "Group 0: landbird / land",
+                1: "Group 1: landbird / water",
+                2: "Group 2: waterbird / land",
+                3: "Group 3: waterbird / water",
+            }
+            return names.get(int(gid), f"Group {int(gid)}")
+
+        return f"Group {int(gid)}"
+
+    def _save_rate_vs_loss_plot(
+        self,
+        relationship,
+        output_dir,
+        meta_step,
+        split_name="val",
+        tag_prefix="meta_step",
+    ):
+        """
+        Save a group-colored scatter plot of raw rater score vs mean
+        per-example inner-model CE loss.
+
+        Each point is one embedding. Each Waterbirds group is drawn as a
+        separate scatter series, so matplotlib automatically assigns a
+        different color to each group.
+        """
+
+        scores = np.asarray(relationship["scores"])
+        losses = np.asarray(relationship["mean_loss"])
+        groups = np.asarray(relationship["groups"])
+        labels = np.asarray(relationship["labels"])
+        attrs = np.asarray(relationship["attrs"])
+        correctness = np.asarray(
+            relationship["mean_correctness"]
+        )
+
+        plot_dir = os.path.join(
+            output_dir,
+            "plots",
+            "rate_vs_loss",
+        )
+        data_dir = os.path.join(
+            output_dir,
+            "plots",
+            "rate_vs_loss_data",
+        )
+
+        os.makedirs(plot_dir, exist_ok=True)
+        os.makedirs(data_dir, exist_ok=True)
+
+        fig, ax = plt.subplots(figsize=(10, 7))
+
+        for gid in sorted(np.unique(groups)):
+            mask = groups == gid
+            ax.scatter(
+                losses[mask],
+                scores[mask],
+                alpha=0.50,
+                s=24,
+                label=self._group_display_name(gid),
+            )
+
+        # Overall least-squares line, matching the spirit of the user's
+        # previous evaluation script.
+        if (
+            len(losses) >= 2
+            and np.std(losses) > 0
+            and np.std(scores) > 0
+        ):
+            slope, intercept, r_value, _, _ = stats.linregress(
+                losses,
+                scores,
+            )
+            x_line = np.linspace(
+                float(losses.min()),
+                float(losses.max()),
+                200,
+            )
+            y_line = slope * x_line + intercept
+            ax.plot(
+                x_line,
+                y_line,
+                linewidth=2,
+                label=f"Overall linear fit (R²={r_value ** 2:.3f})",
+            )
+
+        ax.set_xlabel(
+            "Mean per-example cross-entropy loss across inner models"
+        )
+        ax.set_ylabel("Raw rater score")
+        ax.set_title(
+            f"Rater score vs inner-model loss | {split_name} | "
+            f"step {meta_step}\n"
+            f"Spearman={relationship['spearman_score_vs_loss']:.3f}, "
+            f"Pearson={relationship['pearson_score_vs_loss']:.3f}"
+        )
+        ax.grid(True, linestyle=":", alpha=0.35)
+        ax.legend(loc="best", fontsize=9)
+        fig.tight_layout()
+
+        plot_path = os.path.join(
+            plot_dir,
+            f"{tag_prefix}_{meta_step:06d}_{split_name}.png",
+        )
+        fig.savefig(
+            plot_path,
+            dpi=160,
+            bbox_inches="tight",
+        )
+        plt.close(fig)
+
+        if self.save_plot_data:
+            csv_path = os.path.join(
+                data_dir,
+                f"{tag_prefix}_{meta_step:06d}_{split_name}.csv",
+            )
+
+            with open(csv_path, "w", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(
+                    [
+                        "index",
+                        "raw_rater_score",
+                        "mean_inner_loss",
+                        "mean_inner_correctness",
+                        "group",
+                        "label",
+                        "attribute",
+                    ]
+                )
+
+                for i in range(len(scores)):
+                    writer.writerow(
+                        [
+                            i,
+                            float(scores[i]),
+                            float(losses[i]),
+                            float(correctness[i]),
+                            int(groups[i]),
+                            int(labels[i]),
+                            int(attrs[i]),
+                        ]
+                    )
+
+        log(
+            f"[Rater plot] saved score-vs-loss plot: {plot_path}"
+        )
+
+        return plot_path
+
+    @torch.no_grad()
+    def _classifier_score_loss_relationship(self, dataset, model):
+        """Score-vs-loss relationship for one downstream classifier."""
+
+        loader = DataLoader(
+            dataset,
+            batch_size=self.config.batch_size,
+            shuffle=False,
+            num_workers=self.config.num_workers,
+            pin_memory=True,
+        )
+
+        self.rater.eval()
+        model.eval()
+
+        all_scores = []
+        all_losses = []
+        all_correct = []
+        all_groups = []
+        all_labels = []
+        all_attrs = []
+
+        for z, y, g, a in loader:
+            z = z.to(self.device, non_blocking=True)
+            y_device = y.to(self.device, non_blocking=True)
+
+            scores = self.rater(z)
+            logits = model(z)
+            losses = F.cross_entropy(
+                logits,
+                y_device,
+                reduction="none",
+            )
+            correct = (
+                logits.argmax(dim=1) == y_device
+            ).float()
+
+            all_scores.append(scores.cpu())
+            all_losses.append(losses.cpu())
+            all_correct.append(correct.cpu())
+            all_groups.append(g.cpu())
+            all_labels.append(y.cpu())
+            all_attrs.append(a.cpu())
+
+        scores = torch.cat(all_scores).numpy()
+        losses = torch.cat(all_losses).numpy()
+        correctness = torch.cat(all_correct).numpy()
+        groups = torch.cat(all_groups).numpy()
+        labels = torch.cat(all_labels).numpy()
+        attrs = torch.cat(all_attrs).numpy()
+
+        if (
+            len(scores) >= 2
+            and np.std(scores) > 0
+            and np.std(losses) > 0
+        ):
+            spearman_loss = float(
+                stats.spearmanr(scores, losses).statistic
+            )
+            pearson_loss = float(
+                stats.pearsonr(scores, losses).statistic
+            )
+        else:
+            spearman_loss = 0.0
+            pearson_loss = 0.0
+
+        if (
+            len(scores) >= 2
+            and np.std(scores) > 0
+            and np.std(correctness) > 0
+        ):
+            spearman_correct = float(
+                stats.spearmanr(
+                    scores,
+                    correctness,
+                ).statistic
+            )
+        else:
+            spearman_correct = 0.0
+
+        return {
+            "scores": scores,
+            "mean_loss": losses,
+            "mean_correctness": correctness,
+            "groups": groups,
+            "labels": labels,
+            "attrs": attrs,
+            "spearman_score_vs_loss": spearman_loss,
+            "pearson_score_vs_loss": pearson_loss,
             "spearman_score_vs_correctness": spearman_correct,
         }
 
@@ -1175,11 +1479,16 @@ class Rater(Algorithm):
                 or meta_step % self.config.eval_freq == 0
                 or meta_step == self.meta_steps
             )
+            should_plot = (
+                meta_step == 1
+                or meta_step % self.plot_freq == 0
+                or meta_step == self.meta_steps
+            )
 
-            if should_eval:
+            if should_eval or should_plot:
                 population_metrics = self._evaluate_inner_population(
                     val_dataset,
-                    verbose=True,
+                    verbose=should_eval,
                 )
                 relationship = self._score_loss_relationship(
                     val_dataset,
@@ -1202,12 +1511,27 @@ class Rater(Algorithm):
                     f"score_std={score_std:.6f}, "
                     f"Spearman(score, loss)="
                     f"{relationship['spearman_score_vs_loss']:.4f}, "
+                    f"Pearson(score, loss)="
+                    f"{relationship['pearson_score_vs_loss']:.4f}, "
                     f"Spearman(score, correctness)="
                     f"{relationship['spearman_score_vs_correctness']:.4f}"
                 )
 
-                eval_history.append(
-                    [
+                # Group-colored score-vs-loss diagnostic. By default
+                # plot frequency equals --eval_freq. If config.py defines
+                # rater_plot_freq, that can be controlled independently.
+                if should_plot:
+                    self._save_rate_vs_loss_plot(
+                        relationship=relationship,
+                        output_dir=output_dir,
+                        meta_step=meta_step,
+                        split_name=outer_split,
+                        tag_prefix="meta_step",
+                    )
+
+                if should_eval:
+                    eval_history.append(
+                        [
                         meta_step,
                         outer_loss,
                         score_mean,
@@ -1218,6 +1542,7 @@ class Rater(Algorithm):
                         population_metrics["best_accuracy"],
                         population_metrics["best_wga"],
                         relationship["spearman_score_vs_loss"],
+                        relationship["pearson_score_vs_loss"],
                         relationship["spearman_score_vs_correctness"],
                     ]
                 )
@@ -1256,6 +1581,7 @@ class Rater(Algorithm):
                     "best_inner_accuracy",
                     "best_inner_wga",
                     "spearman_score_vs_loss",
+                    "pearson_score_vs_loss",
                     "spearman_score_vs_correctness",
                 ]
             )
@@ -1331,6 +1657,18 @@ class Rater(Algorithm):
                 f"[Rater FINAL VAL] group {gid}: "
                 f"{100.0 * acc:.2f}%"
             )
+
+        final_val_relationship = self._classifier_score_loss_relationship(
+            val_dataset,
+            self.final_classifier,
+        )
+        self._save_rate_vs_loss_plot(
+            relationship=final_val_relationship,
+            output_dir=output_dir,
+            meta_step=self.meta_steps,
+            split_name=f"{outer_split}_final_classifier",
+            tag_prefix="final",
+        )
 
     # ========================================================
     # Test / final evaluation
@@ -1408,6 +1746,20 @@ class Rater(Algorithm):
                     f"final_metrics_{sp}.pt",
                 )
                 torch.save(final_metrics, metrics_path)
+
+                final_relationship = (
+                    self._classifier_score_loss_relationship(
+                        dataset,
+                        self.final_classifier,
+                    )
+                )
+                self._save_rate_vs_loss_plot(
+                    relationship=final_relationship,
+                    output_dir=output_dir,
+                    meta_step=self.meta_steps,
+                    split_name=f"{sp}_final_classifier",
+                    tag_prefix="final",
+                )
 
             if result_path:
                 with open(result_path, "a") as fout:
