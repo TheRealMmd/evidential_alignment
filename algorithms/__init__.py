@@ -3,3 +3,4 @@ from . import dfr
 from . import jtt
 from . import afr
 from . import evidential_alignment
+from . import rater
