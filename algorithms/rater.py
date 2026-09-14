@@ -118,16 +118,37 @@ class Rater(Algorithm):
 
     Inner update:
 
-        The mapping from raw Rater score to training weight is configurable:
+        First, the CURRENT inner classifier predicts each sample.
 
-        SOFTMAX:
-            w_i = softmax((r_eta(z_i) - mean_batch) / tau)
+        If the prediction is CORRECT:
+            w_i = 1
 
-        SIGMOID:
-            z_i_std = (r_eta(z_i) - mean_batch) / (std_batch + eps)
-            w_i = sigmoid(z_i_std / tau)
+        If the prediction is WRONG:
+            the Rater is evaluated ONLY for that misclassified sample,
+            and its raw score is converted to a rating using the selected
+            Rater transform:
 
-        In BOTH modes, following the requested experimental definition:
+            SOFTMAX:
+                r_i = softmax((score_i - mean_misclassified) / tau)
+
+            SIGMOID:
+                standardized_i =
+                    (score_i - mean_misclassified)
+                    / (std_misclassified + eps)
+                r_i = sigmoid(standardized_i / tau)
+
+            Then:
+                w_i = r_i
+
+        Thus the effective weight follows the Evidential-Alignment-style gate:
+
+            w_i = 1                         if prediction is correct
+            w_i = RaterRating(z_i)          if prediction is wrong
+
+        The Rater is NOT used to determine the training weight of correctly
+        classified samples.
+
+        The requested weighted objective is retained:
 
             L_inner = sum_i w_i CE(h_theta(z_i), y_i)
 
@@ -218,22 +239,20 @@ class Rater(Algorithm):
         )
 
         # ----------------------------------------------------
-        # Raw-score -> training-weight mapping.
+        # Rater-rating transform for MISCLASSIFIED samples only.
         #
-        #   softmax:
-        #       centered = score - batch_mean
-        #       weight = softmax(centered / temperature)
+        # Correctly classified samples always receive weight = 1.
+        # Misclassified samples receive a Rater-derived rating using the
+        # selected softmax/sigmoid transform.
         #
-        #   sigmoid:
-        #       standardized = (score - batch_mean) / (batch_std + eps)
-        #       weight = sigmoid(standardized / temperature)
+        # Effective training rule:
+        #       weight_i = 1                  if correct
+        #       weight_i = rater_rating_i     if misclassified
         #
-        # In both cases the inner loss is:
+        # Inner loss remains:
         #       sum_i weight_i * CE_i
         #
-        # IMPORTANT: for sigmoid the weights do NOT sum to one.
-        # Therefore its inner-loss/gradient scale can be much larger
-        # than in softmax mode. This is intentional in this experiment.
+        # There is NO division by sum(weights).
         # ----------------------------------------------------
         self.weighting = str(
             getattr(self.config, "rater_weighting", "softmax")
@@ -332,15 +351,17 @@ class Rater(Algorithm):
         self.final_classifier = None
 
         log(
-            f"[Rater] Weighting transform = {self.weighting}; "
-            f"temperature = {self.temperature}"
+            f"[Rater] Misclassified-sample Rater transform = "
+            f"{self.weighting}; temperature = {self.temperature}"
         )
-
-        if self.weighting == "sigmoid":
-            log(
-                "[Rater] Sigmoid mode uses standardized batch scores and "
-                "L_inner = sum_i w_i * CE_i WITHOUT dividing by sum(w)."
-            )
+        log(
+            "[Rater] EA-style gating enabled: correct samples get "
+            "weight=1; only misclassified samples use the Rater."
+        )
+        log(
+            "[Rater] Inner objective remains L_inner = sum_i w_i * CE_i "
+            "WITHOUT dividing by sum(w)."
+        )
 
         if self.config.check_point:
             self._load_rater_checkpoint(self.config.check_point)
@@ -448,79 +469,109 @@ class Rater(Algorithm):
         return batch, iterator
 
     # ========================================================
-    # Score -> training-weight transformation
+    # Raw Rater score -> rating transformation
     # ========================================================
 
     def _scores_to_weights(self, raw_scores):
         """
-        Convert unrestricted Rater outputs into the actual weights used
-        by the inner/final classifier loss.
+        Convert raw Rater outputs into ratings in (0, 1).
 
-        SOFTMAX mode
-        ------------
-        centered_i = s_i - mean(s)
-        w_i = softmax(centered_i / temperature)
-
-        Properties:
-            * 0 < w_i < 1
-            * sum_i w_i = 1
-            * average weight = 1 / batch_size
-
-        SIGMOID mode
-        ------------
-        standardized_i =
-            (s_i - mean(s)) / (std(s) + 1e-6)
-
-        w_i = sigmoid(standardized_i / temperature)
-
-        Properties:
-            * 0 < w_i < 1
-            * weights do NOT sum to one
-            * standardized scores avoid saturation caused only by
-              a drifting / expanding raw-score scale
-
-        IMPORTANT
-        ---------
-        We intentionally DO NOT normalize sigmoid weights by their sum
-        later. The requested inner objective is always:
-
-            sum_i w_i * CE_i
+        In the EA-style rule this function is applied to MISCLASSIFIED
+        samples only. Correct samples receive weight exactly 1.
         """
 
-        if self.weighting == "softmax":
-            centered_scores = (
-                raw_scores - raw_scores.mean()
-            )
+        if raw_scores.numel() == 0:
+            return raw_scores
 
+        if self.weighting == "softmax":
+            centered_scores = raw_scores - raw_scores.mean()
             return torch.softmax(
                 centered_scores / self.temperature,
                 dim=0,
             )
 
-        # self.weighting == "sigmoid"
         score_mean = raw_scores.mean()
-
-        # unbiased=False is stable even for very small batches.
-        score_std = raw_scores.std(
-            unbiased=False
-        )
-
+        score_std = raw_scores.std(unbiased=False)
         standardized_scores = (
             raw_scores - score_mean
         ) / (
             score_std + 1e-6
         )
-
         return torch.sigmoid(
             standardized_scores / self.temperature
         )
+
+    def _ea_style_training_weights(
+        self,
+        z,
+        y,
+        logits,
+        raw_scores_all=None,
+    ):
+        """
+        Build effective sample weights:
+
+            weight_i = 1
+                if argmax(logits_i) == y_i
+
+            weight_i = RaterRating(z_i)
+                otherwise
+
+        During actual training `raw_scores_all` is None, so the Rater is
+        called ONLY for misclassified samples. For diagnostics, optional
+        precomputed raw scores can be supplied.
+        """
+
+        pred = logits.argmax(dim=1)
+        correct_mask = pred.eq(y)
+        misclassified_mask = ~correct_mask
+
+        weights = torch.ones(
+            y.shape[0],
+            device=logits.device,
+            dtype=logits.dtype,
+        )
+
+        if not bool(misclassified_mask.any()):
+            empty_scores = torch.empty(
+                0,
+                device=logits.device,
+                dtype=logits.dtype,
+            )
+            return weights, correct_mask, empty_scores
+
+        misclassified_indices = torch.nonzero(
+            misclassified_mask,
+            as_tuple=False,
+        ).squeeze(1)
+
+        if raw_scores_all is None:
+            misclassified_raw_scores = self.rater(
+                z[misclassified_mask]
+            )
+        else:
+            misclassified_raw_scores = raw_scores_all[
+                misclassified_mask
+            ]
+
+        misclassified_ratings = self._scores_to_weights(
+            misclassified_raw_scores
+        )
+
+        weights = weights.index_copy(
+            0,
+            misclassified_indices,
+            misclassified_ratings,
+        )
+
+        return weights, correct_mask, misclassified_raw_scores
 
     # ========================================================
     # Differentiable inner optimization
     # ========================================================
 
     def _inner_unroll(self, inner_model, train_iterator, train_loader):
-        """Perform differentiable weighted inner updates."""
+        """Perform differentiable EA-style weighted inner updates."""
 
         fast_weight = (
             inner_model.linear.weight.detach().clone().requires_grad_(True)
@@ -539,29 +590,27 @@ class Rater(Algorithm):
             z = z.to(self.device, non_blocking=True)
             y = y.to(self.device, non_blocking=True)
 
-            raw_scores = self.rater(z)
-
-            # Actual training weights. The transform is selected by:
-            #     --rater_weighting softmax
-            # or:
-            #     --rater_weighting sigmoid
-            weights = self._scores_to_weights(
-                raw_scores
-            )
-
+            # Predict first. The current prediction determines whether the
+            # example gets weight 1 or a Rater-derived rating.
             logits = F.linear(z, fast_weight, fast_bias)
+
             per_sample_loss = F.cross_entropy(
                 logits,
                 y,
                 reduction="none",
             )
 
-            # Requested objective:
-            #
-            #     L_inner = sum_i w_i * CE_i
-            #
-            # There is deliberately NO division by weights.sum(),
-            # including in sigmoid mode.
+            weights, _, misclassified_raw_scores = (
+                self._ea_style_training_weights(
+                    z=z,
+                    y=y,
+                    logits=logits,
+                    raw_scores_all=None,
+                )
+            )
+
+            # Correct -> 1; wrong -> Rater rating.
+            # No division by sum(weights).
             inner_loss = (
                 per_sample_loss * weights
             ).sum()
@@ -584,7 +633,7 @@ class Rater(Algorithm):
 
             fast_weight = fast_weight - self.inner_lr * grad_w
             fast_bias = fast_bias - self.inner_lr * grad_b
-            last_raw_scores = raw_scores
+            last_raw_scores = misclassified_raw_scores
 
         fast_params = {
             "weight": fast_weight,
@@ -814,20 +863,15 @@ class Rater(Algorithm):
     @torch.no_grad()
     def _score_loss_relationship(self, dataset, models=None):
         """
-        Compare Rater outputs with per-example classifier loss.
+        Diagnostic relationship between raw Rater scores, effective
+        EA-style weights, classifier loss, and correctness.
 
-        For each embedding we compute:
-          * raw rater score r_eta(z);
-          * FINAL SCORE used by the inner loss, computed with the selected
-            weighting transform (softmax or standardized sigmoid);
-          * CE loss for every inner model;
-          * mean CE loss across the inner-model population;
-          * mean correctness across the population;
-          * Waterbirds group / label / attribute.
+        For each inner model:
+            correct -> weight 1
+            wrong   -> Rater rating
 
-        Important: the final score is computed batch-wise exactly like the
-        weight used during inner training. The diagnostic DataLoader uses
-        shuffle=False so this quantity is reproducible across evaluations.
+        `final_scores` is the mean effective weight across the current
+        inner-model population.
         """
 
         if models is None:
@@ -857,13 +901,12 @@ class Rater(Algorithm):
             z = z.to(self.device, non_blocking=True)
             y_device = y.to(self.device, non_blocking=True)
 
+            # Raw scores for all samples are used only for diagnostics.
             raw_scores = self.rater(z)
-            final_scores = self._scores_to_weights(
-                raw_scores
-            )
 
             model_losses = []
             model_correct = []
+            model_weights = []
 
             for model in models:
                 logits = model(z)
@@ -872,25 +915,26 @@ class Rater(Algorithm):
                     y_device,
                     reduction="none",
                 )
-                correct = (
-                    logits.argmax(dim=1) == y_device
-                ).float()
+
+                effective_weights, correct_mask, _ = (
+                    self._ea_style_training_weights(
+                        z=z,
+                        y=y_device,
+                        logits=logits,
+                        raw_scores_all=raw_scores,
+                    )
+                )
 
                 model_losses.append(per_loss)
-                model_correct.append(correct)
+                model_correct.append(correct_mask.float())
+                model_weights.append(effective_weights)
 
-            mean_loss = torch.stack(
-                model_losses,
-                dim=0,
-            ).mean(dim=0)
-
-            mean_correct = torch.stack(
-                model_correct,
-                dim=0,
-            ).mean(dim=0)
+            mean_loss = torch.stack(model_losses, dim=0).mean(dim=0)
+            mean_correct = torch.stack(model_correct, dim=0).mean(dim=0)
+            mean_weight = torch.stack(model_weights, dim=0).mean(dim=0)
 
             all_scores.append(raw_scores.cpu())
-            all_final_scores.append(final_scores.cpu())
+            all_final_scores.append(mean_weight.cpu())
             all_losses.append(mean_loss.cpu())
             all_correct.append(mean_correct.cpu())
             all_groups.append(g.cpu())
@@ -918,22 +962,14 @@ class Rater(Algorithm):
             final_scores, losses
         )
 
-        if (
-            len(scores) >= 2
-            and np.std(scores) > 0
-            and np.std(correctness) > 0
-        ):
+        if len(scores) >= 2 and np.std(scores) > 0 and np.std(correctness) > 0:
             spearman_correct = float(
                 stats.spearmanr(scores, correctness).statistic
             )
         else:
             spearman_correct = 0.0
 
-        if (
-            len(final_scores) >= 2
-            and np.std(final_scores) > 0
-            and np.std(correctness) > 0
-        ):
+        if len(final_scores) >= 2 and np.std(final_scores) > 0 and np.std(correctness) > 0:
             spearman_final_correct = float(
                 stats.spearmanr(final_scores, correctness).statistic
             )
@@ -1085,7 +1121,7 @@ class Rater(Algorithm):
                     [
                         "index",
                         "raw_rater_score",
-                        f"final_{self.weighting}_weight",
+                        "effective_ea_style_weight",
                         "mean_inner_loss",
                         "mean_inner_correctness",
                         "group",
@@ -1134,8 +1170,9 @@ class Rater(Algorithm):
             histogram of unrestricted rater outputs r_eta(z).
 
         score_kind="final":
-            histogram of the FINAL SCORE actually used in the weighted
-            inner loss, using the currently selected weighting transform.
+            histogram of the EFFECTIVE EA-STYLE WEIGHT actually used:
+            correct samples have weight 1; misclassified samples use the
+            selected Rater rating transform.
 
         Density normalization is used so strongly imbalanced Waterbirds
         groups can be compared by distribution shape rather than count.
@@ -1151,10 +1188,12 @@ class Rater(Algorithm):
             values = np.asarray(relationship["final_scores"])
             folder = f"final_score_histogram_{self.weighting}"
             xlabel = (
-                f"Final score ({self.weighting} training weight)"
+                "Effective EA-style training weight "
+                "(correct=1, wrong=Rater rating)"
             )
             title_name = (
-                f"Final {self.weighting} weight distribution"
+                f"EA-style effective weight distribution "
+                f"(wrong uses {self.weighting})"
             )
             filename_kind = "final_score_hist"
         else:
@@ -1239,10 +1278,8 @@ class Rater(Algorithm):
         """
         Save group-colored scatter of FINAL SCORE vs classifier loss.
 
-        FINAL SCORE means the exact positive weight produced after the
-        selected batch-wise weighting transform used by inner training.
-
-        Thus this plot complements the existing raw-score-vs-loss plot.
+        FINAL SCORE means the effective EA-style training weight:
+        correct -> 1; wrong -> Rater rating.
         """
 
         final_scores = np.asarray(relationship["final_scores"])
@@ -1294,10 +1331,11 @@ class Rater(Algorithm):
             "Mean per-example cross-entropy loss across inner models"
         )
         ax.set_ylabel(
-            f"Final score ({self.weighting} training weight)"
+            "Effective EA-style weight (correct=1, wrong=Rater rating)"
         )
         ax.set_title(
-            f"Final {self.weighting} weight vs inner-model loss | "
+            f"EA-style effective weight vs inner-model loss "
+            f"(wrong uses {self.weighting}) | "
             f"{split_name} | "
             f"step {meta_step}\n"
             f"Spearman={relationship['spearman_final_score_vs_loss']:.3f}, "
@@ -1366,7 +1404,7 @@ class Rater(Algorithm):
 
     @torch.no_grad()
     def _classifier_score_loss_relationship(self, dataset, model):
-        """Raw/final Rater score vs loss for one downstream classifier."""
+        """Raw score and effective EA-style weight vs loss for one model."""
 
         loader = DataLoader(
             dataset,
@@ -1392,24 +1430,27 @@ class Rater(Algorithm):
             y_device = y.to(self.device, non_blocking=True)
 
             raw_scores = self.rater(z)
-            final_scores = self._scores_to_weights(
-                raw_scores
+            logits = model(z)
+
+            effective_weights, correct_mask, _ = (
+                self._ea_style_training_weights(
+                    z=z,
+                    y=y_device,
+                    logits=logits,
+                    raw_scores_all=raw_scores,
+                )
             )
 
-            logits = model(z)
             losses = F.cross_entropy(
                 logits,
                 y_device,
                 reduction="none",
             )
-            correct = (
-                logits.argmax(dim=1) == y_device
-            ).float()
 
             all_scores.append(raw_scores.cpu())
-            all_final_scores.append(final_scores.cpu())
+            all_final_scores.append(effective_weights.cpu())
             all_losses.append(losses.cpu())
-            all_correct.append(correct.cpu())
+            all_correct.append(correct_mask.float().cpu())
             all_groups.append(g.cpu())
             all_labels.append(y.cpu())
             all_attrs.append(a.cpu())
@@ -1431,22 +1472,14 @@ class Rater(Algorithm):
             return 0.0, 0.0
 
         spearman_loss, pearson_loss = _corr(scores, losses)
-        spearman_final_loss, pearson_final_loss = _corr(
-            final_scores, losses
-        )
+        spearman_final_loss, pearson_final_loss = _corr(final_scores, losses)
 
         if len(scores) >= 2 and np.std(scores) > 0 and np.std(correctness) > 0:
-            spearman_correct = float(
-                stats.spearmanr(scores, correctness).statistic
-            )
+            spearman_correct = float(stats.spearmanr(scores, correctness).statistic)
         else:
             spearman_correct = 0.0
 
-        if (
-            len(final_scores) >= 2
-            and np.std(final_scores) > 0
-            and np.std(correctness) > 0
-        ):
+        if len(final_scores) >= 2 and np.std(final_scores) > 0 and np.std(correctness) > 0:
             spearman_final_correct = float(
                 stats.spearmanr(final_scores, correctness).statistic
             )
@@ -1471,8 +1504,11 @@ class Rater(Algorithm):
         }
 
     @torch.no_grad()
-    def _compute_scores(self, dataset):
-        """Save raw Rater scores and the selected final training weights."""
+    def _compute_scores(self, dataset, model=None):
+        """
+        Save raw Rater scores and, when a classifier is supplied, the
+        effective EA-style weights for that classifier.
+        """
 
         loader = DataLoader(
             dataset,
@@ -1483,17 +1519,39 @@ class Rater(Algorithm):
         )
 
         self.rater.eval()
-        scores, final_scores, labels, groups, attrs = [], [], [], [], []
+        if model is not None:
+            model.eval()
+
+        scores, final_scores = [], []
+        labels, groups, attrs, correctness = [], [], [], []
 
         for z, y, g, a in loader:
             z = z.to(self.device, non_blocking=True)
+            y_device = y.to(self.device, non_blocking=True)
             batch_scores = self.rater(z)
-            batch_final_scores = self._scores_to_weights(
-                batch_scores
-            )
+
+            if model is None:
+                batch_final_scores = self._scores_to_weights(batch_scores)
+                batch_correctness = torch.full(
+                    (y_device.shape[0],),
+                    float("nan"),
+                    device=self.device,
+                )
+            else:
+                logits = model(z)
+                batch_final_scores, correct_mask, _ = (
+                    self._ea_style_training_weights(
+                        z=z,
+                        y=y_device,
+                        logits=logits,
+                        raw_scores_all=batch_scores,
+                    )
+                )
+                batch_correctness = correct_mask.float()
 
             scores.append(batch_scores.cpu())
             final_scores.append(batch_final_scores.cpu())
+            correctness.append(batch_correctness.cpu())
             labels.append(y.cpu())
             groups.append(g.cpu())
             attrs.append(a.cpu())
@@ -1502,9 +1560,11 @@ class Rater(Algorithm):
             "scores": torch.cat(scores),
             "final_scores": torch.cat(final_scores),
             "training_weights": torch.cat(final_scores),
+            "correctness": torch.cat(correctness),
             "labels": torch.cat(labels),
             "groups": torch.cat(groups),
             "attrs": torch.cat(attrs),
+            "weights_are_ea_style_gated": model is not None,
         }
 
     def _rating_summary(self, payload):
@@ -1522,7 +1582,7 @@ class Rater(Algorithm):
 
         if final_scores is not None:
             lines.append(
-                f"final {self.weighting} weight mean="
+                f"saved final/effective weight mean="
                 f"{final_scores.mean():.6f}, "
                 f"std={final_scores.std():.6f}, "
                 f"min={final_scores.min():.6f}, "
@@ -1574,6 +1634,8 @@ class Rater(Algorithm):
                 "rater_capacity": self.rater_capacity,
                 "rater_weighting": self.weighting,
                 "rater_temperature": self.temperature,
+                "ea_style_correct_weight": 1.0,
+                "ea_style_rater_only_on_misclassified": True,
             },
             path,
         )
@@ -1697,9 +1759,14 @@ class Rater(Algorithm):
         output_dir,
     ):
         """
-        Freeze the learned rater and train a fresh classifier with its
-        per-example weights. This is the downstream classifier whose
-        accuracy/WGA should normally be reported.
+        Freeze the learned Rater and train a fresh classifier with the
+        same EA-style dynamic gate used during bilevel training:
+
+            correct prediction -> weight 1
+            wrong prediction   -> Rater-derived rating
+
+        Correct/misclassified status is recomputed on every minibatch as
+        the classifier changes.
         """
 
         log("[Rater] Training final weighted classifier...")
@@ -1740,19 +1807,29 @@ class Rater(Algorithm):
                 z = z.to(self.device, non_blocking=True)
                 y = y.to(self.device, non_blocking=True)
 
+                # Predict first with the CURRENT classifier.
+                logits = model(z)
+
+                # EA-style dynamic gate:
+                #   correct -> 1
+                #   wrong   -> Rater rating
+                # The Rater is called only on misclassified samples.
                 with torch.no_grad():
-                    raw_scores = self.rater(z)
-                    weights = self._scores_to_weights(
-                        raw_scores
+                    weights, _, _ = self._ea_style_training_weights(
+                        z=z,
+                        y=y,
+                        logits=logits,
+                        raw_scores_all=None,
                     )
 
-                logits = model(z)
                 per_sample_loss = F.cross_entropy(
                     logits,
                     y,
                     reduction="none",
                 )
-                weighted_loss = (per_sample_loss * weights).sum()
+                weighted_loss = (
+                    per_sample_loss * weights
+                ).sum()
 
                 optimizer.zero_grad()
                 weighted_loss.backward()
@@ -1894,6 +1971,10 @@ class Rater(Algorithm):
             f"inner_lr={self.inner_lr}, "
             f"outer_lr={self.outer_lr}, "
             f"temperature={self.temperature}"
+        )
+        log(
+            "[Rater] Effective weighting rule: correct -> 1.0; "
+            f"misclassified -> {self.weighting} Rater rating."
         )
 
         for meta_step in tqdm(
@@ -2101,6 +2182,31 @@ class Rater(Algorithm):
             self.final_classifier,
         )
 
+        # Save ACTUAL EA-style gated weights for the final classifier.
+        final_train_scores = self._compute_scores(
+            train_dataset,
+            model=self.final_classifier,
+        )
+        torch.save(
+            final_train_scores,
+            os.path.join(
+                output_dir,
+                f"rater_scores_{inner_split}_final_classifier.pt",
+            ),
+        )
+
+        final_val_scores = self._compute_scores(
+            val_dataset,
+            model=self.final_classifier,
+        )
+        torch.save(
+            final_val_scores,
+            os.path.join(
+                output_dir,
+                f"rater_scores_{outer_split}_final_classifier.pt",
+            ),
+        )
+
         final_val_metrics = self._evaluate_classifier(
             self.final_classifier,
             val_dataset,
@@ -2167,7 +2273,10 @@ class Rater(Algorithm):
             # ----------------------------------------------
             # Rater-score evaluation
             # ----------------------------------------------
-            payload = self._compute_scores(dataset)
+            payload = self._compute_scores(
+                dataset,
+                model=self.final_classifier,
+            )
             score_path = os.path.join(
                 output_dir,
                 f"rater_scores_{sp}.pt",
