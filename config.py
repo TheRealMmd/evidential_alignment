@@ -35,8 +35,6 @@ def parse_bool(v):
         raise argparse.ArgumentTypeError("Boolean value expected.")
 
 
-# Taken from:
-# https://sumit-ghosh.com/articles/parsing-dictionary-key-value-pairs-kwargs-argparse-python/
 class ParseKwargs(argparse.Action):
     def __call__(self, parser, namespace, values, option_string=None):
         setattr(namespace, self.dest, dict())
@@ -559,10 +557,25 @@ def rater_args(parser):
           -> frozen ImageNet-pretrained ResNet-50
           -> embedding z
           -> rater(z)
-          -> scalar score
+          -> scalar raw score
 
-    The score is converted to a softmax weight and used in the
-    differentiable inner optimization.
+    The raw score can be converted to an inner-loop training
+    weight using either:
+
+        softmax:
+            w_i = softmax((score_i - batch_mean) / temperature)
+
+        sigmoid:
+            standardized_i =
+                (score_i - batch_mean) / (batch_std + eps)
+
+            w_i = sigmoid(standardized_i / temperature)
+
+    In both modes, the current Rater implementation uses:
+
+        L_inner = sum_i w_i * CE_i
+
+    with no division by sum(weights).
     """
 
     parser.add_argument(
@@ -608,8 +621,24 @@ def rater_args(parser):
         type=float,
         default=2.0,
         help=(
-            "temperature used in softmax(rating / temperature) "
-            "to convert ratings to inner-loop weights"
+            "temperature used by the selected Rater weighting "
+            "transform"
+        ),
+    )
+
+    parser.add_argument(
+        "--rater_weighting",
+        type=str,
+        default="softmax",
+        choices=[
+            "softmax",
+            "sigmoid",
+        ],
+        help=(
+            "transform raw Rater scores into inner-loop training "
+            "weights. 'softmax' applies batch softmax; 'sigmoid' "
+            "standardizes scores within the batch and then applies "
+            "sigmoid"
         ),
     )
 
@@ -679,11 +708,9 @@ def get_args():
         description="spurious correlation"
     )
 
-    # Dataset/general algorithms
     data_args(parser)
     training_args(parser)
 
-    # Algorithm-specific arguments
     dfr_args(parser)
     afr_args(parser)
     evidential_alignment_args(parser)
