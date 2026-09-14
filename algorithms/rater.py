@@ -117,8 +117,22 @@ class Rater(Algorithm):
     Image x -> frozen ImageNet ResNet-50 -> z -> r_eta(z) -> scalar score.
 
     Inner update:
-        w_i = softmax(r_eta(z_i) / tau)
-        L_inner = sum_i w_i CE(h_theta(z_i), y_i)
+
+        The mapping from raw Rater score to training weight is configurable:
+
+        SOFTMAX:
+            w_i = softmax((r_eta(z_i) - mean_batch) / tau)
+
+        SIGMOID:
+            z_i_std = (r_eta(z_i) - mean_batch) / (std_batch + eps)
+            w_i = sigmoid(z_i_std / tau)
+
+        In BOTH modes, following the requested experimental definition:
+
+            L_inner = sum_i w_i CE(h_theta(z_i), y_i)
+
+        There is intentionally NO division by sum_i w_i.
+
         theta' = theta - alpha * grad_theta L_inner
 
     Outer update:
@@ -128,9 +142,9 @@ class Rater(Algorithm):
     In addition to learning the rater, this implementation:
       * evaluates the persistent inner-model population during meta-training;
       * logs average accuracy and worst-group accuracy (WGA);
-      * measures correlation between raw/final softmax Rater scores and loss;
-      * saves per-group histograms for raw Rater scores and final softmax scores;
-      * saves raw-score-vs-loss and final-softmax-score-vs-loss scatter plots;
+      * measures correlation between raw/final Rater training weights and loss;
+      * saves per-group histograms for raw Rater scores and final training weights;
+      * saves raw-score-vs-loss and final-weight-vs-loss scatter plots;
       * optionally saves intermediate rater/inner-model checkpoints;
       * after meta-training, freezes the learned rater and trains a fresh
         final classifier using the learned rater weights;
@@ -202,6 +216,29 @@ class Rater(Algorithm):
         self.temperature = float(
             getattr(self.config, "rater_temperature", 2.0)
         )
+
+        # ----------------------------------------------------
+        # Raw-score -> training-weight mapping.
+        #
+        #   softmax:
+        #       centered = score - batch_mean
+        #       weight = softmax(centered / temperature)
+        #
+        #   sigmoid:
+        #       standardized = (score - batch_mean) / (batch_std + eps)
+        #       weight = sigmoid(standardized / temperature)
+        #
+        # In both cases the inner loss is:
+        #       sum_i weight_i * CE_i
+        #
+        # IMPORTANT: for sigmoid the weights do NOT sum to one.
+        # Therefore its inner-loss/gradient scale can be much larger
+        # than in softmax mode. This is intentional in this experiment.
+        # ----------------------------------------------------
+        self.weighting = str(
+            getattr(self.config, "rater_weighting", "softmax")
+        ).lower()
+
         self.refresh_steps = int(
             getattr(self.config, "rater_refresh_steps", 100)
         )
@@ -264,6 +301,12 @@ class Rater(Algorithm):
             raise ValueError("rater_num_inner_models must be >= 1.")
         if self.temperature <= 0:
             raise ValueError("rater_temperature must be > 0.")
+
+        if self.weighting not in {"softmax", "sigmoid"}:
+            raise ValueError(
+                "rater_weighting must be either 'softmax' or 'sigmoid'."
+            )
+
         if self.final_selection not in {"accuracy", "wga", "loss"}:
             raise ValueError(
                 "rater_final_selection must be one of: accuracy, wga, loss"
@@ -287,6 +330,17 @@ class Rater(Algorithm):
 
         self.inner_models = []
         self.final_classifier = None
+
+        log(
+            f"[Rater] Weighting transform = {self.weighting}; "
+            f"temperature = {self.temperature}"
+        )
+
+        if self.weighting == "sigmoid":
+            log(
+                "[Rater] Sigmoid mode uses standardized batch scores and "
+                "L_inner = sum_i w_i * CE_i WITHOUT dividing by sum(w)."
+            )
 
         if self.config.check_point:
             self._load_rater_checkpoint(self.config.check_point)
@@ -394,6 +448,74 @@ class Rater(Algorithm):
         return batch, iterator
 
     # ========================================================
+    # Score -> training-weight transformation
+    # ========================================================
+
+    def _scores_to_weights(self, raw_scores):
+        """
+        Convert unrestricted Rater outputs into the actual weights used
+        by the inner/final classifier loss.
+
+        SOFTMAX mode
+        ------------
+        centered_i = s_i - mean(s)
+        w_i = softmax(centered_i / temperature)
+
+        Properties:
+            * 0 < w_i < 1
+            * sum_i w_i = 1
+            * average weight = 1 / batch_size
+
+        SIGMOID mode
+        ------------
+        standardized_i =
+            (s_i - mean(s)) / (std(s) + 1e-6)
+
+        w_i = sigmoid(standardized_i / temperature)
+
+        Properties:
+            * 0 < w_i < 1
+            * weights do NOT sum to one
+            * standardized scores avoid saturation caused only by
+              a drifting / expanding raw-score scale
+
+        IMPORTANT
+        ---------
+        We intentionally DO NOT normalize sigmoid weights by their sum
+        later. The requested inner objective is always:
+
+            sum_i w_i * CE_i
+        """
+
+        if self.weighting == "softmax":
+            centered_scores = (
+                raw_scores - raw_scores.mean()
+            )
+
+            return torch.softmax(
+                centered_scores / self.temperature,
+                dim=0,
+            )
+
+        # self.weighting == "sigmoid"
+        score_mean = raw_scores.mean()
+
+        # unbiased=False is stable even for very small batches.
+        score_std = raw_scores.std(
+            unbiased=False
+        )
+
+        standardized_scores = (
+            raw_scores - score_mean
+        ) / (
+            score_std + 1e-6
+        )
+
+        return torch.sigmoid(
+            standardized_scores / self.temperature
+        )
+
+    # ========================================================
     # Differentiable inner optimization
     # ========================================================
 
@@ -418,10 +540,13 @@ class Rater(Algorithm):
             y = y.to(self.device, non_blocking=True)
 
             raw_scores = self.rater(z)
-            centered_scores = raw_scores - raw_scores.mean()
-            weights = torch.softmax(
-                centered_scores / self.temperature,
-                dim=0,
+
+            # Actual training weights. The transform is selected by:
+            #     --rater_weighting softmax
+            # or:
+            #     --rater_weighting sigmoid
+            weights = self._scores_to_weights(
+                raw_scores
             )
 
             logits = F.linear(z, fast_weight, fast_bias)
@@ -431,9 +556,15 @@ class Rater(Algorithm):
                 reduction="none",
             )
 
-            # Softmax weights sum to one, so this has the same
-            # basic scale as a conventional mean CE loss.
-            inner_loss = (per_sample_loss * weights).sum()
+            # Requested objective:
+            #
+            #     L_inner = sum_i w_i * CE_i
+            #
+            # There is deliberately NO division by weights.sum(),
+            # including in sigmoid mode.
+            inner_loss = (
+                per_sample_loss * weights
+            ).sum()
 
             if self.inner_reg_weight > 0:
                 inner_reg = (
@@ -687,15 +818,15 @@ class Rater(Algorithm):
 
         For each embedding we compute:
           * raw rater score r_eta(z);
-          * FINAL SCORE used by the inner loss, i.e. the batch-softmax
-            weight softmax((score - batch_mean) / temperature);
+          * FINAL SCORE used by the inner loss, computed with the selected
+            weighting transform (softmax or standardized sigmoid);
           * CE loss for every inner model;
           * mean CE loss across the inner-model population;
           * mean correctness across the population;
           * Waterbirds group / label / attribute.
 
-        Important: the final softmax score is batch-relative, exactly like
-        the weight used during inner training. The diagnostic DataLoader uses
+        Important: the final score is computed batch-wise exactly like the
+        weight used during inner training. The diagnostic DataLoader uses
         shuffle=False so this quantity is reproducible across evaluations.
         """
 
@@ -727,10 +858,8 @@ class Rater(Algorithm):
             y_device = y.to(self.device, non_blocking=True)
 
             raw_scores = self.rater(z)
-            centered_scores = raw_scores - raw_scores.mean()
-            final_scores = torch.softmax(
-                centered_scores / self.temperature,
-                dim=0,
+            final_scores = self._scores_to_weights(
+                raw_scores
             )
 
             model_losses = []
@@ -814,7 +943,7 @@ class Rater(Algorithm):
         return {
             "scores": scores,
             "final_scores": final_scores,
-            "softmax_weights": final_scores,
+            "training_weights": final_scores,
             "mean_loss": losses,
             "mean_correctness": correctness,
             "groups": groups,
@@ -956,12 +1085,14 @@ class Rater(Algorithm):
                     [
                         "index",
                         "raw_rater_score",
-                        "final_softmax_score",
+                        f"final_{self.weighting}_weight",
                         "mean_inner_loss",
                         "mean_inner_correctness",
                         "group",
                         "label",
                         "attribute",
+                        "weighting_method",
+                        "temperature",
                     ]
                 )
 
@@ -976,6 +1107,8 @@ class Rater(Algorithm):
                             int(groups[i]),
                             int(labels[i]),
                             int(attrs[i]),
+                            self.weighting,
+                            float(self.temperature),
                         ]
                     )
 
@@ -1002,7 +1135,7 @@ class Rater(Algorithm):
 
         score_kind="final":
             histogram of the FINAL SCORE actually used in the weighted
-            inner loss, i.e. the per-batch softmax weight.
+            inner loss, using the currently selected weighting transform.
 
         Density normalization is used so strongly imbalanced Waterbirds
         groups can be compared by distribution shape rather than count.
@@ -1016,9 +1149,13 @@ class Rater(Algorithm):
             filename_kind = "raw_score_hist"
         elif score_kind == "final":
             values = np.asarray(relationship["final_scores"])
-            folder = "final_score_histogram"
-            xlabel = "Final score (batch-softmax training weight)"
-            title_name = "Final softmax-score distribution"
+            folder = f"final_score_histogram_{self.weighting}"
+            xlabel = (
+                f"Final score ({self.weighting} training weight)"
+            )
+            title_name = (
+                f"Final {self.weighting} weight distribution"
+            )
             filename_kind = "final_score_hist"
         else:
             raise ValueError(
@@ -1103,9 +1240,7 @@ class Rater(Algorithm):
         Save group-colored scatter of FINAL SCORE vs classifier loss.
 
         FINAL SCORE means the exact positive weight produced after the
-        batch softmax used by inner training:
-
-            w_i = softmax((r_i - mean(r_batch)) / temperature).
+        selected batch-wise weighting transform used by inner training.
 
         Thus this plot complements the existing raw-score-vs-loss plot.
         """
@@ -1117,7 +1252,7 @@ class Rater(Algorithm):
         plot_dir = os.path.join(
             output_dir,
             "plots",
-            "final_score_vs_loss",
+            f"final_score_vs_loss_{self.weighting}",
         )
         os.makedirs(plot_dir, exist_ok=True)
 
@@ -1158,9 +1293,12 @@ class Rater(Algorithm):
         ax.set_xlabel(
             "Mean per-example cross-entropy loss across inner models"
         )
-        ax.set_ylabel("Final score (batch-softmax training weight)")
+        ax.set_ylabel(
+            f"Final score ({self.weighting} training weight)"
+        )
         ax.set_title(
-            f"Final softmax score vs inner-model loss | {split_name} | "
+            f"Final {self.weighting} weight vs inner-model loss | "
+            f"{split_name} | "
             f"step {meta_step}\n"
             f"Spearman={relationship['spearman_final_score_vs_loss']:.3f}, "
             f"Pearson={relationship['pearson_final_score_vs_loss']:.3f}"
@@ -1254,10 +1392,8 @@ class Rater(Algorithm):
             y_device = y.to(self.device, non_blocking=True)
 
             raw_scores = self.rater(z)
-            centered_scores = raw_scores - raw_scores.mean()
-            final_scores = torch.softmax(
-                centered_scores / self.temperature,
-                dim=0,
+            final_scores = self._scores_to_weights(
+                raw_scores
             )
 
             logits = model(z)
@@ -1320,7 +1456,7 @@ class Rater(Algorithm):
         return {
             "scores": scores,
             "final_scores": final_scores,
-            "softmax_weights": final_scores,
+            "training_weights": final_scores,
             "mean_loss": losses,
             "mean_correctness": correctness,
             "groups": groups,
@@ -1336,7 +1472,7 @@ class Rater(Algorithm):
 
     @torch.no_grad()
     def _compute_scores(self, dataset):
-        """Save both raw Rater scores and batch-softmax final scores."""
+        """Save raw Rater scores and the selected final training weights."""
 
         loader = DataLoader(
             dataset,
@@ -1352,10 +1488,8 @@ class Rater(Algorithm):
         for z, y, g, a in loader:
             z = z.to(self.device, non_blocking=True)
             batch_scores = self.rater(z)
-            centered_scores = batch_scores - batch_scores.mean()
-            batch_final_scores = torch.softmax(
-                centered_scores / self.temperature,
-                dim=0,
+            batch_final_scores = self._scores_to_weights(
+                batch_scores
             )
 
             scores.append(batch_scores.cpu())
@@ -1367,14 +1501,13 @@ class Rater(Algorithm):
         return {
             "scores": torch.cat(scores),
             "final_scores": torch.cat(final_scores),
-            "softmax_weights": torch.cat(final_scores),
+            "training_weights": torch.cat(final_scores),
             "labels": torch.cat(labels),
             "groups": torch.cat(groups),
             "attrs": torch.cat(attrs),
         }
 
-    @staticmethod
-    def _rating_summary(payload):
+    def _rating_summary(self, payload):
         scores = payload["scores"]
         final_scores = payload.get("final_scores", None)
         labels = payload["labels"]
@@ -1389,7 +1522,8 @@ class Rater(Algorithm):
 
         if final_scores is not None:
             lines.append(
-                f"final softmax score mean={final_scores.mean():.6f}, "
+                f"final {self.weighting} weight mean="
+                f"{final_scores.mean():.6f}, "
                 f"std={final_scores.std():.6f}, "
                 f"min={final_scores.min():.6f}, "
                 f"max={final_scores.max():.6f}"
@@ -1438,6 +1572,8 @@ class Rater(Algorithm):
                 "backbone": self.config.backbone,
                 "pretrained": True,
                 "rater_capacity": self.rater_capacity,
+                "rater_weighting": self.weighting,
+                "rater_temperature": self.temperature,
             },
             path,
         )
@@ -1606,10 +1742,8 @@ class Rater(Algorithm):
 
                 with torch.no_grad():
                     raw_scores = self.rater(z)
-                    centered_scores = raw_scores - raw_scores.mean()
-                    weights = torch.softmax(
-                        centered_scores / self.temperature,
-                        dim=0,
+                    weights = self._scores_to_weights(
+                        raw_scores
                     )
 
                 logits = model(z)
@@ -1822,6 +1956,7 @@ class Rater(Algorithm):
 
                 log(
                     f"[Rater step {meta_step}] "
+                    f"weighting={self.weighting}, "
                     f"outer_loss={outer_loss:.6f}, "
                     f"score_mean={score_mean:.6f}, "
                     f"score_std={score_std:.6f}, "
@@ -2107,4 +2242,3 @@ class Rater(Algorithm):
                                 f"group {gid} accuracy={acc:.6f}\n"
                             )
                         fout.write("\n")
-
