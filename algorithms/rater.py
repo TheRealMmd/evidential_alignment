@@ -173,7 +173,9 @@ class Rater(Algorithm):
             misclassified -> trained-Rater rating;
       * saves the ACTUAL final-classifier weight histograms every epoch;
       * selects the downstream classifier by validation WGA by default;
-      * evaluates the final classifier on validation/test splits.
+      * evaluates the final classifier on validation/test splits;
+      * uses a persistent shared embedding cache so frozen ResNet-50
+        embeddings are extracted once and reused across timestamped runs.
     """
 
     def __init__(self, config):
@@ -218,6 +220,42 @@ class Rater(Algorithm):
         log(
             f"[Rater] Frozen {self.config.backbone} feature extractor. "
             f"Embedding dimension = {self.feature_dim}"
+        )
+
+        # ----------------------------------------------------
+        # Persistent SHARED embedding cache
+        # ----------------------------------------------------
+        #
+        # Preferred Colab usage:
+        #
+        #   RATER_EMBEDDING_CACHE_ROOT=
+        #       /content/drive/MyDrive/evidential_alignment_colab/embeddings
+        #
+        # The Rater automatically creates a representation-specific
+        # namespace under that root. The cache is independent of the
+        # timestamped experiment directory, so future runs reuse the same
+        # train/val/test embeddings and do not run ResNet-50 again.
+        # ----------------------------------------------------
+        self.embedding_cache_root = str(
+            getattr(
+                self.config,
+                "rater_embedding_cache_root",
+                "",
+            )
+            or os.environ.get(
+                "RATER_EMBEDDING_CACHE_ROOT",
+                "",
+            )
+        ).strip()
+
+        # One-time notebook preparation mode. When enabled, train() only
+        # builds/validates the persistent embeddings and then returns.
+        self.precompute_embeddings_only = (
+            os.environ.get(
+                "RATER_PRECOMPUTE_EMBEDDINGS_ONLY",
+                "0",
+            ).strip().lower()
+            in {"1", "true", "yes", "y"}
         )
 
         # ----------------------------------------------------
@@ -386,32 +424,248 @@ class Rater(Algorithm):
             self._load_rater_checkpoint(self.config.check_point)
 
     # ========================================================
-    # Embedding extraction
+    # Persistent shared embedding cache
     # ========================================================
 
-    @torch.no_grad()
-    def _extract_embedding_dataset(self, split, cache_dir):
-        """Extract and cache frozen ImageNet backbone embeddings."""
+    @staticmethod
+    def _safe_cache_token(value):
+        """Convert a value into a filesystem-safe cache token."""
+        token = str(value)
+        token = token.replace("/", "_")
+        token = token.replace(chr(92), "_")
+        token = token.replace(" ", "_")
+        token = token.replace(".", "p")
+        return token
 
-        os.makedirs(cache_dir, exist_ok=True)
-        cache_file = os.path.join(
-            cache_dir,
-            f"{self.config.backbone}_imagenet_{split}.pt",
+    def _embedding_cache_namespace(self):
+        """
+        Namespace shared embeddings by representation.
+        """
+        dataset_name = self._safe_cache_token(
+            getattr(self.config, "dataset", "dataset")
+        )
+        backbone_name = self._safe_cache_token(
+            self.config.backbone
+        )
+        resolution = self._safe_cache_token(
+            getattr(self.config, "resolution", 224)
         )
 
-        if os.path.exists(cache_file):
-            log(f"[Rater] Loading cached embeddings: {cache_file}")
+        pretrained_tag = (
+            "imagenet_pretrained"
+            if bool(self.config.pretrained)
+            else "not_pretrained"
+        )
+
+        return os.path.join(
+            dataset_name,
+            f"{backbone_name}_{pretrained_tag}",
+            f"resolution_{resolution}",
+        )
+
+    def _resolve_embedding_cache_dir(self, output_dir=None):
+        """
+        Return the embedding directory used by every train/test call.
+
+        If RATER_EMBEDDING_CACHE_ROOT is set, timestamped experiments all
+        share the same tensors. Otherwise fall back to the old per-run cache.
+        """
+        if self.embedding_cache_root:
+            cache_dir = os.path.join(
+                self.embedding_cache_root,
+                self._embedding_cache_namespace(),
+            )
+        else:
+            if output_dir is None:
+                raise ValueError(
+                    "No shared embedding cache root was configured and "
+                    "output_dir is None."
+                )
+
+            cache_dir = os.path.join(
+                output_dir,
+                "embedding_cache",
+            )
+
+        os.makedirs(cache_dir, exist_ok=True)
+        return cache_dir
+
+    def _embedding_cache_metadata(self, split):
+        """Metadata used to validate persistent cache files."""
+        metadata = {
+            "dataset": str(
+                getattr(self.config, "dataset", "")
+            ),
+            "split": str(split),
+            "backbone": str(self.config.backbone),
+            "pretrained": bool(self.config.pretrained),
+            "resolution": int(
+                getattr(self.config, "resolution", 224)
+            ),
+            "feature_dim": int(self.feature_dim),
+            "n_classes": int(self.n_classes),
+        }
+
+        if "subset" in str(split):
+            metadata.update(
+                {
+                    "split_train": float(
+                        getattr(self.config, "split_train", 1.0)
+                    ),
+                    "split_val": float(
+                        getattr(self.config, "split_val", 1.0)
+                    ),
+                    "seed": int(
+                        getattr(self.config, "seed", 0)
+                    ),
+                }
+            )
+
+        return metadata
+
+    def _embedding_cache_filename(self, split):
+        """
+        Standard deterministic splits become:
+            train_no_aug.pt
+            val.pt
+            test.pt
+
+        Subset splits additionally encode split ratios and seed.
+        """
+        safe_split = self._safe_cache_token(split)
+
+        if "subset" in str(split):
+            split_train = self._safe_cache_token(
+                getattr(self.config, "split_train", 1.0)
+            )
+            split_val = self._safe_cache_token(
+                getattr(self.config, "split_val", 1.0)
+            )
+            seed = self._safe_cache_token(
+                getattr(self.config, "seed", 0)
+            )
+
+            safe_split = (
+                f"{safe_split}"
+                f"_splittrain_{split_train}"
+                f"_splitval_{split_val}"
+                f"_seed_{seed}"
+            )
+
+        return f"{safe_split}.pt"
+
+    @staticmethod
+    def _cache_payload_has_required_tensors(payload):
+        return (
+            isinstance(payload, dict)
+            and "embeddings" in payload
+            and "labels" in payload
+            and "groups" in payload
+            and "attrs" in payload
+        )
+
+    def _cache_metadata_matches(self, payload, split):
+        """Reject stale or incompatible shared cache files."""
+        if not self._cache_payload_has_required_tensors(payload):
+            return False
+
+        embeddings = payload["embeddings"]
+
+        if (
+            not torch.is_tensor(embeddings)
+            or embeddings.ndim != 2
+            or embeddings.shape[1] != self.feature_dim
+        ):
+            return False
+
+        expected = self._embedding_cache_metadata(split)
+        actual = payload.get("cache_metadata", None)
+
+        if actual is None:
+            return False
+
+        for key, expected_value in expected.items():
+            if actual.get(key) != expected_value:
+                return False
+
+        n = embeddings.shape[0]
+
+        return all(
+            torch.is_tensor(payload[key])
+            and payload[key].shape[0] == n
+            for key in ("labels", "groups", "attrs")
+        )
+
+    def _load_embedding_cache_file(self, cache_file, split):
+        """
+        Load one persistent cache file, returning None if it must be rebuilt.
+        """
+        if not os.path.exists(cache_file):
+            return None
+
+        log(
+            f"[Rater embeddings] Found shared cache: {cache_file}"
+        )
+
+        try:
             payload = torch.load(
                 cache_file,
                 map_location="cpu",
                 weights_only=False,
             )
-            return EmbeddingTensorDataset(
-                payload["embeddings"],
-                payload["labels"],
-                payload["groups"],
-                payload["attrs"],
+        except Exception as exc:
+            log(
+                f"[Rater embeddings] Cache load failed "
+                f"({type(exc).__name__}: {exc}). "
+                f"Regenerating split '{split}'."
             )
+            return None
+
+        if not self._cache_metadata_matches(payload, split):
+            log(
+                f"[Rater embeddings] Cache metadata mismatch for "
+                f"split '{split}'. Regenerating it once."
+            )
+            return None
+
+        log(
+            f"[Rater embeddings] USING stored embeddings for "
+            f"'{split}' ({len(payload['labels'])} samples). "
+            f"No backbone extraction is performed."
+        )
+
+        return EmbeddingTensorDataset(
+            payload["embeddings"],
+            payload["labels"],
+            payload["groups"],
+            payload["attrs"],
+        )
+
+    @torch.no_grad()
+    def _extract_embedding_dataset(self, split, cache_dir=None):
+        """
+        Load a split from persistent storage.
+
+        On the first ever request, extract with the frozen backbone once and
+        save it. Every later run directly loads the stored tensor file.
+        """
+        if cache_dir is None:
+            cache_dir = self._resolve_embedding_cache_dir()
+
+        os.makedirs(cache_dir, exist_ok=True)
+
+        cache_file = os.path.join(
+            cache_dir,
+            self._embedding_cache_filename(split),
+        )
+
+        cached_dataset = self._load_embedding_cache_file(
+            cache_file,
+            split,
+        )
+
+        if cached_dataset is not None:
+            return cached_dataset
 
         if split not in self.dataloaders:
             raise ValueError(
@@ -419,18 +673,29 @@ class Rater(Algorithm):
                 f"{list(self.dataloaders.keys())}"
             )
 
+        log(
+            f"[Rater embeddings] Shared cache MISS for '{split}'. "
+            f"Extracting it ONCE with frozen "
+            f"{self.config.backbone}..."
+        )
+
         loader = self.dataloaders[split]
         self.feature_model.eval()
 
-        embeddings, labels, groups, attrs = [], [], [], []
+        embeddings = []
+        labels = []
+        groups = []
+        attrs = []
 
         for x, y, g, a in tqdm(
             loader,
-            desc=f"Extracting {split} embeddings",
+            desc=f"ONE-TIME embedding extraction: {split}",
         ):
-            x = x.to(self.device, non_blocking=True)
+            x = x.to(
+                self.device,
+                non_blocking=True,
+            )
 
-            # The rater never sees the image directly.
             z = self.feature_model.backbone(x)
 
             embeddings.append(z.detach().cpu())
@@ -448,11 +713,21 @@ class Rater(Algorithm):
             "labels": labels,
             "groups": groups,
             "attrs": attrs,
+            "cache_metadata": self._embedding_cache_metadata(split),
         }
-        torch.save(payload, cache_file)
+
+        tmp_file = cache_file + f".tmp.{os.getpid()}"
+        torch.save(payload, tmp_file)
+        os.replace(tmp_file, cache_file)
 
         log(
-            f"[Rater] Saved {len(labels)} {split} embeddings to {cache_file}"
+            f"[Rater embeddings] SAVED persistent shared "
+            f"'{split}' embeddings ({len(labels)} samples):"
+        )
+        log(f"[Rater embeddings]   {cache_file}")
+        log(
+            "[Rater embeddings] Future runs will load this file "
+            "directly and will NOT extract this split again."
         )
 
         return EmbeddingTensorDataset(
@@ -462,6 +737,71 @@ class Rater(Algorithm):
             attrs,
         )
 
+    def _precompute_shared_embeddings(self, output_dir):
+        """
+        Build/validate all deterministic embeddings without meta-training.
+
+        Current Waterbirds workflow:
+            train_no_aug
+            val
+            test
+
+        Future subset/calibration splits are cached too when available.
+        """
+        cache_dir = self._resolve_embedding_cache_dir(output_dir)
+
+        preferred_splits = [
+            "train_no_aug",
+            "val",
+            "test",
+            "train_subset1",
+            "train_subset2",
+            "val_subset1",
+            "val_subset2",
+        ]
+
+        available = [
+            split
+            for split in preferred_splits
+            if split in self.dataloaders
+        ]
+
+        log("[Rater embeddings] PRECOMPUTE-ONLY mode.")
+        log(
+            f"[Rater embeddings] Shared cache directory: {cache_dir}"
+        )
+        log(
+            f"[Rater embeddings] Preparing splits: {available}"
+        )
+
+        for split in available:
+            dataset = self._extract_embedding_dataset(
+                split,
+                cache_dir,
+            )
+            log(
+                f"[Rater embeddings] READY: "
+                f"{split} -> {len(dataset)} samples"
+            )
+
+        ready_file = os.path.join(cache_dir, "_READY.txt")
+
+        with open(ready_file, "w") as f:
+            f.write("Persistent Rater embedding cache is ready.\n")
+            for split in available:
+                f.write(
+                    self._embedding_cache_filename(split)
+                    + "\n"
+                )
+
+        log(
+            f"[Rater embeddings] Cache preparation complete: "
+            f"{ready_file}"
+        )
+
+    # ========================================================
+    # Inner models
+    # ========================================================
     # ========================================================
     # Inner models
     # ========================================================
@@ -1653,6 +1993,10 @@ class Rater(Algorithm):
                 "rater_capacity": self.rater_capacity,
                 "rater_weighting": self.weighting,
                 "rater_temperature": self.temperature,
+                "embedding_cache_root": self.embedding_cache_root,
+                "embedding_cache_namespace": (
+                    self._embedding_cache_namespace()
+                ),
                 "ea_style_correct_weight": 1.0,
                 "ea_style_rater_only_on_misclassified": True,
             },
@@ -2333,11 +2677,18 @@ class Rater(Algorithm):
     def train(self, output_dir, split="train"):
         os.makedirs(output_dir, exist_ok=True)
 
-        cache_dir = os.path.join(output_dir, "embedding_cache")
+        if self.precompute_embeddings_only:
+            self._precompute_shared_embeddings(output_dir)
+            return
+
+        cache_dir = self._resolve_embedding_cache_dir(output_dir)
         inner_split, outer_split = self._resolve_meta_splits(split)
 
         log(f"[Rater] Inner/meta-train split: {inner_split}")
         log(f"[Rater] Outer/held-out split: {outer_split}")
+        log(
+            f"[Rater embeddings] Shared cache directory: {cache_dir}"
+        )
 
         train_dataset = self._extract_embedding_dataset(
             inner_split,
@@ -2670,12 +3021,20 @@ class Rater(Algorithm):
     def test(self, output_dir, split=("test",), result_path=""):
         """
         For each requested split:
-          1. compute and save rater scores;
-          2. if a final weighted classifier is available, evaluate its
+          1. load its PERSISTENT shared embeddings;
+          2. compute and save rater scores;
+          3. if a final weighted classifier is available, evaluate its
              loss, overall accuracy, per-group accuracy and WGA.
         """
 
-        cache_dir = os.path.join(output_dir, "embedding_cache")
+        if self.precompute_embeddings_only:
+            log(
+                "[Rater embeddings] Precompute-only run finished; "
+                "skipping normal test/evaluation stage."
+            )
+            return
+
+        cache_dir = self._resolve_embedding_cache_dir(output_dir)
 
         if isinstance(split, str):
             split = [split]
