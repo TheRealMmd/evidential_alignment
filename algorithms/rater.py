@@ -171,7 +171,8 @@ class Rater(Algorithm):
       * uses an EA-style calibration protocol for the final classifier:
             val_subset1 -> calibration/training,
             val_subset2 -> model selection,
-            test        -> final reporting;
+            test        -> diagnostic evaluation after every final epoch;
+      * test metrics are NEVER used for checkpoint selection;
       * trains a fresh final classifier with EA-style dynamic weighting:
             correct -> 1,
             misclassified -> trained-Rater rating;
@@ -2438,9 +2439,11 @@ class Rater(Algorithm):
         self,
         calibration_dataset,
         selection_dataset,
+        test_dataset,
         output_dir,
         calibration_split="val_subset1",
         selection_split="val_subset2",
+        test_split="test",
     ):
         """
         Train a FRESH downstream linear classifier on the CALIBRATION set
@@ -2449,7 +2452,11 @@ class Rater(Algorithm):
         EA-style data roles:
             calibration_dataset -> classifier optimization
             selection_dataset   -> checkpoint/model selection
-            test                -> final reporting only
+            test_dataset        -> DIAGNOSTIC evaluation every epoch
+
+        IMPORTANT:
+            test metrics are NEVER used for checkpoint selection.
+            They are logged only so we can inspect generalization dynamics.
 
         Per minibatch:
             current classifier predicts
@@ -2484,6 +2491,14 @@ class Rater(Algorithm):
         log(
             f"[Final classifier] SELECTION split = "
             f"{selection_split} ({len(selection_dataset)} samples)"
+        )
+        log(
+            f"[Final classifier] TEST diagnostic split = "
+            f"{test_split} ({len(test_dataset)} samples)"
+        )
+        log(
+            "[Final classifier] TEST is diagnostic only and is NOT used "
+            "for checkpoint selection."
         )
         log(
             f"[Final classifier] selection metric = "
@@ -2638,6 +2653,17 @@ class Rater(Algorithm):
                 selection_metrics
             )
 
+            # ------------------------------------------------
+            # TEST evaluation after EVERY epoch.
+            #
+            # This is DIAGNOSTIC ONLY. It must not influence
+            # checkpoint/model selection.
+            # ------------------------------------------------
+            test_metrics = self._evaluate_classifier(
+                model,
+                test_dataset,
+            )
+
             history.append(
                 [
                     epoch,
@@ -2646,6 +2672,9 @@ class Rater(Algorithm):
                     selection_metrics["loss"],
                     selection_metrics["accuracy"],
                     selection_metrics["worst_group_accuracy"],
+                    test_metrics["loss"],
+                    test_metrics["accuracy"],
+                    test_metrics["worst_group_accuracy"],
                     float(epoch_weights_np.mean()),
                     float(epoch_weights_np.std()),
                     float(epoch_correctness_np.mean()),
@@ -2660,7 +2689,21 @@ class Rater(Algorithm):
                 f"selection_loss={selection_metrics['loss']:.6f}, "
                 f"selection_acc={100.0 * selection_metrics['accuracy']:.2f}%, "
                 f"selection_WGA="
-                f"{100.0 * selection_metrics['worst_group_accuracy']:.2f}%"
+                f"{100.0 * selection_metrics['worst_group_accuracy']:.2f}%, "
+                f"test_loss={test_metrics['loss']:.6f}, "
+                f"test_acc={100.0 * test_metrics['accuracy']:.2f}%, "
+                f"test_WGA="
+                f"{100.0 * test_metrics['worst_group_accuracy']:.2f}%"
+            )
+
+            test_group_str = ", ".join(
+                f"g{gid}={100.0 * acc:.2f}%"
+                for gid, acc in test_metrics["group_accuracy"].items()
+            )
+
+            log(
+                f"[Final classifier epoch {epoch:03d} TEST groups] "
+                f"{test_group_str}"
             )
 
             # Post-epoch selection-set weight histogram.
@@ -2765,6 +2808,9 @@ class Rater(Algorithm):
                     "selection_loss",
                     "selection_accuracy",
                     "selection_wga",
+                    "test_loss",
+                    "test_accuracy",
+                    "test_wga",
                     "mean_effective_calibration_weight",
                     "std_effective_train_weight",
                     "fraction_correct_before_update",
@@ -3069,6 +3115,12 @@ class Rater(Algorithm):
             cache_dir,
         )
 
+        test_split = "test"
+        test_dataset = self._extract_embedding_dataset(
+            test_split,
+            cache_dir,
+        )
+
         log(
             "[Rater] Final-classifier EA-style calibration protocol:"
         )
@@ -3081,15 +3133,20 @@ class Rater(Algorithm):
             f"({len(selection_dataset)} samples)"
         )
         log(
-            "[Rater]   final reporting       = test"
+            "[Rater]   test diagnostics      = test after EVERY epoch"
+        )
+        log(
+            "[Rater]   checkpoint selection  = selection split ONLY"
         )
 
         self.final_classifier = self._train_final_classifier(
             calibration_dataset,
             selection_dataset,
+            test_dataset,
             output_dir,
             calibration_split=calibration_split,
             selection_split=selection_split,
+            test_split=test_split,
         )
 
         final_model_path = os.path.join(
