@@ -112,7 +112,7 @@ class InnerLinearClassifier(nn.Module):
 @register_algorithm("rater")
 class Rater(Algorithm):
     """
-    Bilevel feature rater.
+    Frozen trained feature-Rater used only for final-classifier training.
 
     Image x -> frozen ImageNet ResNet-50 -> z -> r_eta(z) -> scalar score.
 
@@ -2824,409 +2824,302 @@ class Rater(Algorithm):
         return model
 
     # ========================================================
-    # Main training
+    # Main training -- FROZEN RATER / FINAL CLASSIFIER ONLY
     # ========================================================
 
     def train(self, output_dir, split="train"):
-        os.makedirs(output_dir, exist_ok=True)
+        """
+        FINAL-CLASSIFIER-ONLY mode.
 
-        if self.precompute_embeddings_only:
-            self._precompute_shared_embeddings(output_dir)
-            return
+        This function intentionally performs NO Rater meta-learning.
 
-        cache_dir = self._resolve_embedding_cache_dir(output_dir)
-        inner_split, outer_split = self._resolve_meta_splits(split)
+        Required workflow:
+          1. load an already-trained Rater through --check_point;
+          2. freeze it;
+          3. use val_subset1 as the calibration/training set;
+          4. use val_subset2 only for checkpoint/model selection;
+          5. evaluate test after every final-classifier epoch;
+          6. train only a fresh Linear(2048, 2) final classifier.
 
-        log(f"[Rater] Inner/meta-train split: {inner_split}")
-        log(f"[Rater] Outer/held-out split: {outer_split}")
-        log(
-            f"[Rater embeddings] Shared cache directory: {cache_dir}"
+        Rater weights keep the requested EA-style rule:
+
+            correct sample -> weight = 1
+            wrong sample   -> frozen-Rater rating
+
+        and:
+
+            L = SUM_i weight_i * CE_i
+
+        There is NO division by sum(weights).
+        """
+
+        os.makedirs(
+            output_dir,
+            exist_ok=True,
         )
-
-        train_dataset = self._extract_embedding_dataset(
-            inner_split,
-            cache_dir,
-        )
-        val_dataset = self._extract_embedding_dataset(
-            outer_split,
-            cache_dir,
-        )
-
-        train_loader = DataLoader(
-            train_dataset,
-            batch_size=self.config.batch_size,
-            shuffle=True,
-            num_workers=self.config.num_workers,
-            pin_memory=True,
-        )
-        val_loader = DataLoader(
-            val_dataset,
-            batch_size=self.config.batch_size,
-            shuffle=True,
-            num_workers=self.config.num_workers,
-            pin_memory=True,
-        )
-
-        train_iterator = iter(train_loader)
-        val_iterator = iter(val_loader)
-        self._initialize_inner_population()
-
-        refresh_period = max(1, self.refresh_steps)
-        refresh_offsets = [
-            (i * refresh_period) // self.num_inner_models
-            for i in range(self.num_inner_models)
-        ]
-
-        best_outer_loss = float("inf")
-        best_path = os.path.join(output_dir, "best_rater.pt")
-        latest_path = os.path.join(output_dir, "latest_rater.pt")
-        history_path = os.path.join(output_dir, "rater_history.csv")
-        eval_history_path = os.path.join(output_dir, "rater_eval.csv")
-
-        history = []
-        eval_history = []
-
-        log("[Rater] Starting feature-rater bilevel optimization")
-        log(
-            f"[Rater] meta_steps={self.meta_steps}, "
-            f"inner_steps={self.inner_steps}, "
-            f"inner_models={self.num_inner_models}, "
-            f"inner_lr={self.inner_lr}, "
-            f"outer_lr={self.outer_lr}, "
-            f"temperature={self.temperature}"
-        )
-        log(
-            "[Rater] Effective weighting rule: correct -> 1.0; "
-            f"misclassified -> {self.weighting} Rater rating."
-        )
-
-        for meta_step in tqdm(
-            range(1, self.meta_steps + 1),
-            desc="Rater meta-training",
-        ):
-            # Staggered reset of persistent inner models.
-            if meta_step > 1:
-                position = (meta_step - 1) % refresh_period
-                for i, offset in enumerate(refresh_offsets):
-                    if position == offset:
-                        self.inner_models[i] = self._new_inner_model()
-
-            outer_loss, train_iterator, val_iterator = self._meta_step(
-                train_iterator,
-                val_iterator,
-                train_loader,
-                val_loader,
-            )
-
-            history.append([meta_step, outer_loss])
-
-            if outer_loss < best_outer_loss:
-                best_outer_loss = outer_loss
-                self._save_rater_checkpoint(
-                    best_path,
-                    meta_step,
-                    outer_loss,
-                )
-
-            should_eval = (
-                meta_step == 1
-                or meta_step % self.config.eval_freq == 0
-                or meta_step == self.meta_steps
-            )
-            should_plot = (
-                meta_step == 1
-                or meta_step % self.plot_freq == 0
-                or meta_step == self.meta_steps
-            )
-
-            if should_eval or should_plot:
-                population_metrics = self._evaluate_inner_population(
-                    val_dataset,
-                    verbose=should_eval,
-                )
-                relationship = self._score_loss_relationship(
-                    val_dataset,
-                    models=self.inner_models,
-                )
-
-                with torch.no_grad():
-                    sample_z = val_dataset.embeddings[
-                        : min(1024, len(val_dataset))
-                    ].to(self.device)
-                    self.rater.eval()
-                    sample_scores = self.rater(sample_z)
-                    score_mean = sample_scores.mean().item()
-                    score_std = sample_scores.std().item()
-
-                log(
-                    f"[Rater step {meta_step}] "
-                    f"weighting={self.weighting}, "
-                    f"outer_loss={outer_loss:.6f}, "
-                    f"score_mean={score_mean:.6f}, "
-                    f"score_std={score_std:.6f}, "
-                    f"Spearman(score, loss)="
-                    f"{relationship['spearman_score_vs_loss']:.4f}, "
-                    f"Pearson(score, loss)="
-                    f"{relationship['pearson_score_vs_loss']:.4f}, "
-                    f"Spearman(score, correctness)="
-                    f"{relationship['spearman_score_vs_correctness']:.4f}, "
-                    f"Spearman(final_score, loss)="
-                    f"{relationship['spearman_final_score_vs_loss']:.4f}, "
-                    f"Pearson(final_score, loss)="
-                    f"{relationship['pearson_final_score_vs_loss']:.4f}"
-                )
-
-                # Group-colored score-vs-loss diagnostic. By default
-                # plot frequency equals --eval_freq. If config.py defines
-                # rater_plot_freq, that can be controlled independently.
-                if should_plot:
-                    self._save_all_score_diagnostics(
-                        relationship=relationship,
-                        output_dir=output_dir,
-                        meta_step=meta_step,
-                        split_name=outer_split,
-                        tag_prefix="meta_step",
-                    )
-
-                if should_eval:
-                    eval_history.append(
-                        [
-                        meta_step,
-                        outer_loss,
-                        score_mean,
-                        score_std,
-                        population_metrics["mean_loss"],
-                        population_metrics["mean_accuracy"],
-                        population_metrics["mean_wga"],
-                        population_metrics["best_accuracy"],
-                        population_metrics["best_wga"],
-                        relationship["spearman_score_vs_loss"],
-                        relationship["pearson_score_vs_loss"],
-                        relationship["spearman_score_vs_correctness"],
-                        relationship["spearman_final_score_vs_loss"],
-                        relationship["pearson_final_score_vs_loss"],
-                        relationship["spearman_final_score_vs_correctness"],
-                    ]
-                )
-
-            if (
-                getattr(self.config, "save_freq", 0) > 0
-                and meta_step % self.config.save_freq == 0
-            ):
-                self._save_population_snapshot(output_dir, meta_step)
 
         # ----------------------------------------------------
-        # Save meta histories
+        # A trained Rater checkpoint is mandatory.
+        # __init__ already calls _load_rater_checkpoint() when
+        # --check_point is provided.
         # ----------------------------------------------------
-        self._save_rater_checkpoint(
-            latest_path,
-            self.meta_steps,
-            history[-1][1],
-        )
-
-        with open(history_path, "w", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow(["meta_step", "outer_loss"])
-            writer.writerows(history)
-
-        with open(eval_history_path, "w", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow(
-                [
-                    "meta_step",
-                    "outer_loss",
-                    "score_mean",
-                    "score_std",
-                    "mean_inner_loss",
-                    "mean_inner_accuracy",
-                    "mean_inner_wga",
-                    "best_inner_accuracy",
-                    "best_inner_wga",
-                    "spearman_score_vs_loss",
-                    "pearson_score_vs_loss",
-                    "spearman_score_vs_correctness",
-                    "spearman_final_score_vs_loss",
-                    "pearson_final_score_vs_loss",
-                    "spearman_final_score_vs_correctness",
-                ]
+        checkpoint_path = str(
+            getattr(
+                self.config,
+                "check_point",
+                "",
             )
-            writer.writerows(eval_history)
+        ).strip()
 
-        # ----------------------------------------------------
-        # Restore best rater
-        # ----------------------------------------------------
-        checkpoint = torch.load(
-            best_path,
-            map_location="cpu",
-            weights_only=False,
+        if not checkpoint_path:
+            raise ValueError(
+                "Frozen-Rater final-classifier mode requires "
+                "--check_point /path/to/best_rater.pt"
+            )
+
+        if not os.path.exists(checkpoint_path):
+            raise ValueError(
+                f"Rater checkpoint does not exist: "
+                f"{checkpoint_path}"
+            )
+
+        # Make absolutely sure we are using the requested trained
+        # checkpoint and that it cannot change.
+        self._load_rater_checkpoint(
+            checkpoint_path
         )
-        self.rater.load_state_dict(checkpoint["rater_sd"])
-        self.rater.to(self.device)
+
+        self.rater.to(
+            self.device
+        )
         self.rater.eval()
 
+        for p in self.rater.parameters():
+            p.requires_grad_(False)
+
+        # No Rater optimization is allowed in this experiment.
+        self.inner_models = []
+
+        log("=" * 90)
         log(
-            f"[Rater] Meta-training complete. "
-            f"Best outer loss = {best_outer_loss:.6f}"
+            "[Frozen Rater] FINAL-CLASSIFIER-ONLY MODE"
         )
         log(
-            f"[Rater] Restored TRAINED best Rater checkpoint "
-            f"from meta step {checkpoint.get('meta_step', 'unknown')}. "
-            f"This Rater is now frozen and used to train the "
-            f"fresh final classifier."
+            f"[Frozen Rater] loaded checkpoint: "
+            f"{checkpoint_path}"
+        )
+        log(
+            "[Frozen Rater] NO meta steps, NO inner models, "
+            "NO Rater optimizer updates."
+        )
+        log(
+            "[Frozen Rater] Only a fresh final "
+            "Linear(2048, 2) classifier will be trained."
+        )
+        log("=" * 90)
+
+        # ----------------------------------------------------
+        # Persistent embedding cache
+        # ----------------------------------------------------
+        cache_dir = (
+            self._resolve_embedding_cache_dir(
+                output_dir
+            )
         )
 
-        # Save learned scores on inner/outer datasets.
-        train_scores = self._compute_scores(train_dataset)
-        torch.save(
-            train_scores,
-            os.path.join(
-                output_dir,
-                f"rater_scores_{inner_split}.pt",
-            ),
-        )
-
-        val_scores = self._compute_scores(val_dataset)
-        torch.save(
-            val_scores,
-            os.path.join(
-                output_dir,
-                f"rater_scores_{outer_split}.pt",
-            ),
+        log(
+            f"[Frozen Rater embeddings] shared cache: "
+            f"{cache_dir}"
         )
 
         # ----------------------------------------------------
-        # EA-style CALIBRATION stage for the final classifier.
+        # EA-style validation split.
         #
-        # val_subset1 = calibration/training
-        # val_subset2 = held-out model selection
-        # test        = final reporting
+        # This is the exact issue that caused the previous run
+        # to fail: split_val was 1.0, so val_subset1/2 did not
+        # exist.
         # ----------------------------------------------------
-        (
-            calibration_split,
-            selection_split,
-        ) = self._resolve_final_classifier_splits()
+        if not self._has_ea_calibration_split():
+            raise ValueError(
+                "Frozen-Rater calibration requires "
+                "val_subset1 and val_subset2. "
+                "Run main.py with --split_val 0.4."
+            )
 
-        calibration_dataset = self._extract_embedding_dataset(
-            calibration_split,
-            cache_dir,
-        )
-        selection_dataset = self._extract_embedding_dataset(
-            selection_split,
-            cache_dir,
-        )
-
+        calibration_split = "val_subset1"
+        selection_split = "val_subset2"
         test_split = "test"
-        test_dataset = self._extract_embedding_dataset(
-            test_split,
-            cache_dir,
+
+        # ----------------------------------------------------
+        # Load stored embeddings. If val_subset1/2 have never
+        # been cached before, they are extracted ONCE and then
+        # persist in Drive for future runs.
+        # ----------------------------------------------------
+        calibration_dataset = (
+            self._extract_embedding_dataset(
+                calibration_split,
+                cache_dir,
+            )
+        )
+
+        selection_dataset = (
+            self._extract_embedding_dataset(
+                selection_split,
+                cache_dir,
+            )
+        )
+
+        test_dataset = (
+            self._extract_embedding_dataset(
+                test_split,
+                cache_dir,
+            )
         )
 
         log(
-            "[Rater] Final-classifier EA-style calibration protocol:"
+            "[Frozen Rater] EA-style final-classifier protocol:"
         )
         log(
-            f"[Rater]   calibration/training = {calibration_split} "
+            f"[Frozen Rater] calibration/train = "
+            f"{calibration_split} "
             f"({len(calibration_dataset)} samples)"
         )
         log(
-            f"[Rater]   model selection      = {selection_split} "
+            f"[Frozen Rater] selection        = "
+            f"{selection_split} "
             f"({len(selection_dataset)} samples)"
         )
         log(
-            "[Rater]   test diagnostics      = test after EVERY epoch"
+            f"[Frozen Rater] test             = "
+            f"{test_split} "
+            f"({len(test_dataset)} samples)"
         )
         log(
-            "[Rater]   checkpoint selection  = selection split ONLY"
+            "[Frozen Rater] checkpoint selection uses "
+            "ONLY the selection split."
+        )
+        log(
+            "[Frozen Rater] test is evaluated every epoch "
+            "for diagnostics only."
         )
 
-        self.final_classifier = self._train_final_classifier(
-            calibration_dataset,
-            selection_dataset,
-            test_dataset,
-            output_dir,
-            calibration_split=calibration_split,
-            selection_split=selection_split,
-            test_split=test_split,
+        # ----------------------------------------------------
+        # Train a completely NEW final classifier.
+        #
+        # _train_final_classifier already:
+        #   * freezes the Rater,
+        #   * applies correct->1 / wrong->Rater,
+        #   * saves actual weight histograms each epoch,
+        #   * evaluates selection every epoch,
+        #   * evaluates TEST every epoch,
+        #   * selects best model by selection WGA by default.
+        # ----------------------------------------------------
+        self.final_classifier = (
+            self._train_final_classifier(
+                calibration_dataset,
+                selection_dataset,
+                test_dataset,
+                output_dir,
+                calibration_split=calibration_split,
+                selection_split=selection_split,
+                test_split=test_split,
+            )
         )
 
+        # ----------------------------------------------------
+        # Save restored-best final classifier
+        # ----------------------------------------------------
         final_model_path = os.path.join(
             output_dir,
             "final_weighted_classifier.pt",
         )
+
         self._save_final_classifier(
             final_model_path,
             self.final_classifier,
         )
 
-        final_calibration_scores = self._compute_scores(
-            calibration_dataset,
-            model=self.final_classifier,
+        log(
+            f"[Frozen Rater] saved BEST final classifier: "
+            f"{final_model_path}"
         )
+
+        # ----------------------------------------------------
+        # Save frozen-Rater + final-classifier weights/scores
+        # for calibration and selection sets.
+        # ----------------------------------------------------
+        final_calibration_scores = (
+            self._compute_scores(
+                calibration_dataset,
+                model=self.final_classifier,
+            )
+        )
+
         torch.save(
             final_calibration_scores,
             os.path.join(
                 output_dir,
-                f"rater_scores_{calibration_split}_final_classifier.pt",
+                "rater_scores_val_subset1_final_classifier.pt",
             ),
         )
 
-        final_selection_scores = self._compute_scores(
-            selection_dataset,
-            model=self.final_classifier,
+        final_selection_scores = (
+            self._compute_scores(
+                selection_dataset,
+                model=self.final_classifier,
+            )
         )
+
         torch.save(
             final_selection_scores,
             os.path.join(
                 output_dir,
-                f"rater_scores_{selection_split}_final_classifier.pt",
+                "rater_scores_val_subset2_final_classifier.pt",
             ),
         )
 
-        final_calibration_metrics = self._evaluate_classifier(
-            self.final_classifier,
-            calibration_dataset,
-        )
-
-        final_selection_metrics = self._evaluate_classifier(
-            self.final_classifier,
-            selection_dataset,
-        )
-
-        log(
-            f"[Rater FINAL CALIBRATION] "
-            f"loss={final_calibration_metrics['loss']:.6f}, "
-            f"acc={100.0 * final_calibration_metrics['accuracy']:.2f}%, "
-            f"WGA="
-            f"{100.0 * final_calibration_metrics['worst_group_accuracy']:.2f}%"
-        )
-
-        log(
-            f"[Rater FINAL SELECTION] "
-            f"loss={final_selection_metrics['loss']:.6f}, "
-            f"acc={100.0 * final_selection_metrics['accuracy']:.2f}%, "
-            f"WGA="
-            f"{100.0 * final_selection_metrics['worst_group_accuracy']:.2f}%"
-        )
-
-        for gid, acc in final_selection_metrics["group_accuracy"].items():
-            log(
-                f"[Rater FINAL SELECTION] group {gid}: "
-                f"{100.0 * acc:.2f}%"
-            )
-
-        final_selection_relationship = (
-            self._classifier_score_loss_relationship(
+        # ----------------------------------------------------
+        # Report BEST-restored classifier on all three sets.
+        # ----------------------------------------------------
+        for split_name, dataset in [
+            (
+                calibration_split,
+                calibration_dataset,
+            ),
+            (
+                selection_split,
                 selection_dataset,
-                self.final_classifier,
+            ),
+            (
+                test_split,
+                test_dataset,
+            ),
+        ]:
+            metrics = (
+                self._evaluate_classifier(
+                    self.final_classifier,
+                    dataset,
+                )
             )
-        )
-        self._save_all_score_diagnostics(
-            relationship=final_selection_relationship,
-            output_dir=output_dir,
-            meta_step=self.meta_steps,
-            split_name=f"{selection_split}_final_classifier",
-            tag_prefix="final",
-        )
+
+            group_str = ", ".join(
+                f"g{gid}="
+                f"{100.0 * acc:.2f}%"
+                for gid, acc
+                in metrics[
+                    "group_accuracy"
+                ].items()
+            )
+
+            log(
+                f"[BEST FINAL {split_name}] "
+                f"loss={metrics['loss']:.6f}, "
+                f"acc="
+                f"{100.0 * metrics['accuracy']:.2f}%, "
+                f"WGA="
+                f"{100.0 * metrics['worst_group_accuracy']:.2f}% "
+                f"({group_str})"
+            )
 
     # ========================================================
     # Test / final evaluation
