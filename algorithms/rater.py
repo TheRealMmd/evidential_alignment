@@ -168,6 +168,10 @@ class Rater(Algorithm):
       * saves raw-score-vs-loss and final-weight-vs-loss scatter plots;
       * optionally saves intermediate rater/inner-model checkpoints;
       * after meta-training, restores and freezes the BEST trained Rater;
+      * uses an EA-style calibration protocol for the final classifier:
+            val_subset1 -> calibration/training,
+            val_subset2 -> model selection,
+            test        -> final reporting;
       * trains a fresh final classifier with EA-style dynamic weighting:
             correct -> 1,
             misclassified -> trained-Rater rating;
@@ -387,6 +391,33 @@ class Rater(Algorithm):
 
         if self.final_plot_freq < 1:
             raise ValueError("rater_final_plot_freq must be >= 1.")
+
+        # ----------------------------------------------------
+        # EA-style calibration protocol for the FINAL classifier
+        # ----------------------------------------------------
+        #
+        # With --split_val < 1, prepare_data() creates:
+        #
+        #   val_subset1 -> calibration set
+        #   val_subset2 -> held-out selection set
+        #
+        # This updated Rater uses:
+        #
+        #   * original train_no_aug for inner-model training
+        #   * val_subset1 as the Rater outer/calibration signal
+        #   * val_subset1 to train the fresh final classifier
+        #   * val_subset2 only for final-classifier checkpoint selection
+        #   * test only for final reporting
+        #
+        # This keeps val_subset2 untouched during Rater meta-training.
+        # ----------------------------------------------------
+        self.use_calibration_final = bool(
+            getattr(
+                self.config,
+                "rater_use_calibration_final",
+                True,
+            )
+        )
 
         # ----------------------------------------------------
         # Rater
@@ -2075,23 +2106,62 @@ class Rater(Algorithm):
     # Split handling
     # ========================================================
 
+    def _has_ea_calibration_split(self):
+        """
+        Return True when the validation set has been split into
+        val_subset1 / val_subset2.
+        """
+        return (
+            float(
+                getattr(
+                    self.config,
+                    "split_val",
+                    1.0,
+                )
+            ) < 1.0
+            and "val_subset1" in self.dataloaders
+            and "val_subset2" in self.dataloaders
+        )
+
     def _resolve_meta_splits(self, split):
         """
-        Default:
+        Rater bilevel data protocol.
+
+        EA-style calibration mode (--split_val < 1):
+            inner/meta-train = train_no_aug
+            outer/meta-val   = val_subset1
+
+        This reserves val_subset2 for final-classifier model selection.
+
+        Legacy mode (--split_val == 1):
             inner/meta-train = train_no_aug
             outer/meta-val   = val
         """
 
-        if split == "train":
-            return "train_no_aug", "val"
+        if split in {"train", "train_no_aug"}:
+            inner_split = "train_no_aug"
 
-        if split == "train_no_aug":
-            return "train_no_aug", "val"
+            if (
+                self.use_calibration_final
+                and self._has_ea_calibration_split()
+            ):
+                return inner_split, "val_subset1"
+
+            return inner_split, "val"
 
         if split == "train_subset1":
             if "train_no_aug_subset1" in self.dataloaders:
-                return "train_no_aug_subset1", "val"
-            return split, "val"
+                inner_split = "train_no_aug_subset1"
+            else:
+                inner_split = split
+
+            if (
+                self.use_calibration_final
+                and self._has_ea_calibration_split()
+            ):
+                return inner_split, "val_subset1"
+
+            return inner_split, "val"
 
         if split == "val_subset1":
             if "val_subset2" not in self.dataloaders:
@@ -2102,6 +2172,28 @@ class Rater(Algorithm):
             return "val_subset1", "val_subset2"
 
         return split, "val"
+
+    def _resolve_final_classifier_splits(self):
+        """
+        Final classifier protocol.
+
+        EA-style:
+            calibration / classifier training = val_subset1
+            checkpoint selection              = val_subset2
+            final reporting                   = test
+        """
+        if self.use_calibration_final:
+            if not self._has_ea_calibration_split():
+                raise ValueError(
+                    "EA-style final-classifier calibration is enabled, "
+                    "but val_subset1/val_subset2 do not exist. "
+                    "Run with --split_val 0.4 (the EA repository example) "
+                    "or another value < 1."
+                )
+
+            return "val_subset1", "val_subset2"
+
+        return "train_no_aug", "val"
 
     # ========================================================
     # Final-classifier epoch diagnostics
@@ -2344,13 +2436,20 @@ class Rater(Algorithm):
 
     def _train_final_classifier(
         self,
-        train_dataset,
-        val_dataset,
+        calibration_dataset,
+        selection_dataset,
         output_dir,
+        calibration_split="val_subset1",
+        selection_split="val_subset2",
     ):
         """
-        Train a FRESH downstream linear classifier with the already-trained
-        Rater frozen as the weighting network.
+        Train a FRESH downstream linear classifier on the CALIBRATION set
+        with the already-trained Rater frozen as the weighting network.
+
+        EA-style data roles:
+            calibration_dataset -> classifier optimization
+            selection_dataset   -> checkpoint/model selection
+            test                -> final reporting only
 
         Per minibatch:
             current classifier predicts
@@ -2371,12 +2470,20 @@ class Rater(Algorithm):
           * CSV of all actual weights/group/correctness values;
           * validation effective-weight histogram.
 
-        By default, the best final classifier is selected by validation WGA.
+        By default, the best final classifier is selected by held-out selection WGA.
         """
 
         log(
             "[Rater] Training fresh final classifier with "
             "FROZEN trained Rater..."
+        )
+        log(
+            f"[Final classifier] CALIBRATION/TRAIN split = "
+            f"{calibration_split} ({len(calibration_dataset)} samples)"
+        )
+        log(
+            f"[Final classifier] SELECTION split = "
+            f"{selection_split} ({len(selection_dataset)} samples)"
         )
         log(
             f"[Final classifier] selection metric = "
@@ -2403,7 +2510,7 @@ class Rater(Algorithm):
         )
 
         train_loader = DataLoader(
-            train_dataset,
+            calibration_dataset,
             batch_size=self.config.batch_size,
             shuffle=True,
             num_workers=self.config.num_workers,
@@ -2518,17 +2625,17 @@ class Rater(Algorithm):
                     weights=epoch_weights_np,
                     groups=epoch_groups_np,
                     correctness=epoch_correctness_np,
-                    split_name="train",
+                    split_name=calibration_split,
                 )
 
-            # Held-out validation evaluation.
-            val_metrics = self._evaluate_classifier(
+            # Held-out selection evaluation.
+            selection_metrics = self._evaluate_classifier(
                 model,
-                val_dataset,
+                selection_dataset,
             )
 
             selection_value = self._selection_value(
-                val_metrics
+                selection_metrics
             )
 
             history.append(
@@ -2536,9 +2643,9 @@ class Rater(Algorithm):
                     epoch,
                     train_weighted_loss,
                     train_acc,
-                    val_metrics["loss"],
-                    val_metrics["accuracy"],
-                    val_metrics["worst_group_accuracy"],
+                    selection_metrics["loss"],
+                    selection_metrics["accuracy"],
+                    selection_metrics["worst_group_accuracy"],
                     float(epoch_weights_np.mean()),
                     float(epoch_weights_np.std()),
                     float(epoch_correctness_np.mean()),
@@ -2547,29 +2654,29 @@ class Rater(Algorithm):
 
             log(
                 f"[Final classifier epoch {epoch:03d}] "
-                f"weighted_train_loss={train_weighted_loss:.6f}, "
-                f"train_acc={100.0 * train_acc:.2f}%, "
+                f"weighted_calibration_loss={train_weighted_loss:.6f}, "
+                f"calibration_acc={100.0 * train_acc:.2f}%, "
                 f"mean_effective_weight={epoch_weights_np.mean():.4f}, "
-                f"val_loss={val_metrics['loss']:.6f}, "
-                f"val_acc={100.0 * val_metrics['accuracy']:.2f}%, "
-                f"val_WGA="
-                f"{100.0 * val_metrics['worst_group_accuracy']:.2f}%"
+                f"selection_loss={selection_metrics['loss']:.6f}, "
+                f"selection_acc={100.0 * selection_metrics['accuracy']:.2f}%, "
+                f"selection_WGA="
+                f"{100.0 * selection_metrics['worst_group_accuracy']:.2f}%"
             )
 
-            # Post-epoch validation weight histogram.
+            # Post-epoch selection-set weight histogram.
             if should_plot_final:
-                val_relationship = (
+                selection_relationship = (
                     self._classifier_score_loss_relationship(
-                        val_dataset,
+                        selection_dataset,
                         model,
                     )
                 )
 
                 self._save_group_score_histogram(
-                    relationship=val_relationship,
+                    relationship=selection_relationship,
                     output_dir=output_dir,
                     meta_step=epoch,
-                    split_name="val_final_classifier_epoch",
+                    split_name=f"{selection_split}_final_classifier_epoch",
                     tag_prefix="final_classifier",
                     score_kind="final",
                 )
@@ -2580,14 +2687,14 @@ class Rater(Algorithm):
                 best_epoch = epoch
 
                 best_metrics = {
-                    "loss": float(val_metrics["loss"]),
-                    "accuracy": float(val_metrics["accuracy"]),
+                    "loss": float(selection_metrics["loss"]),
+                    "accuracy": float(selection_metrics["accuracy"]),
                     "worst_group_accuracy": float(
-                        val_metrics["worst_group_accuracy"]
+                        selection_metrics["worst_group_accuracy"]
                     ),
                     "group_accuracy": {
                         int(k): float(v)
-                        for k, v in val_metrics[
+                        for k, v in selection_metrics[
                             "group_accuracy"
                         ].items()
                     },
@@ -2604,7 +2711,7 @@ class Rater(Algorithm):
                         "epoch": best_epoch,
                         "selection_metric": self.final_selection,
                         "selection_value": float(best_value),
-                        "val_metrics": best_metrics,
+                        "selection_metrics": best_metrics,
                     },
                     os.path.join(
                         output_dir,
@@ -2615,8 +2722,8 @@ class Rater(Algorithm):
                 log(
                     f"[Final classifier] NEW BEST at epoch "
                     f"{best_epoch:03d}: "
-                    f"val_acc={100.0 * best_metrics['accuracy']:.2f}%, "
-                    f"val_WGA="
+                    f"selection_acc={100.0 * best_metrics['accuracy']:.2f}%, "
+                    f"selection_WGA="
                     f"{100.0 * best_metrics['worst_group_accuracy']:.2f}% "
                     f"(selected by {self.final_selection})"
                 )
@@ -2634,8 +2741,8 @@ class Rater(Algorithm):
         log(
             f"[Final classifier] Restored selected epoch "
             f"{best_epoch:03d}. "
-            f"val_acc={100.0 * best_metrics['accuracy']:.2f}%, "
-            f"val_WGA="
+            f"selection_acc={100.0 * best_metrics['accuracy']:.2f}%, "
+            f"selection_WGA="
             f"{100.0 * best_metrics['worst_group_accuracy']:.2f}%."
         )
 
@@ -2653,12 +2760,12 @@ class Rater(Algorithm):
             writer.writerow(
                 [
                     "epoch",
-                    "weighted_train_loss",
-                    "train_accuracy",
-                    "val_loss",
-                    "val_accuracy",
-                    "val_wga",
-                    "mean_effective_train_weight",
+                    "weighted_calibration_loss",
+                    "calibration_accuracy",
+                    "selection_loss",
+                    "selection_accuracy",
+                    "selection_wga",
+                    "mean_effective_calibration_weight",
                     "std_effective_train_weight",
                     "fraction_correct_before_update",
                 ]
@@ -2942,12 +3049,47 @@ class Rater(Algorithm):
         )
 
         # ----------------------------------------------------
-        # Train a fresh final classifier with learned weights.
+        # EA-style CALIBRATION stage for the final classifier.
+        #
+        # val_subset1 = calibration/training
+        # val_subset2 = held-out model selection
+        # test        = final reporting
         # ----------------------------------------------------
+        (
+            calibration_split,
+            selection_split,
+        ) = self._resolve_final_classifier_splits()
+
+        calibration_dataset = self._extract_embedding_dataset(
+            calibration_split,
+            cache_dir,
+        )
+        selection_dataset = self._extract_embedding_dataset(
+            selection_split,
+            cache_dir,
+        )
+
+        log(
+            "[Rater] Final-classifier EA-style calibration protocol:"
+        )
+        log(
+            f"[Rater]   calibration/training = {calibration_split} "
+            f"({len(calibration_dataset)} samples)"
+        )
+        log(
+            f"[Rater]   model selection      = {selection_split} "
+            f"({len(selection_dataset)} samples)"
+        )
+        log(
+            "[Rater]   final reporting       = test"
+        )
+
         self.final_classifier = self._train_final_classifier(
-            train_dataset,
-            val_dataset,
+            calibration_dataset,
+            selection_dataset,
             output_dir,
+            calibration_split=calibration_split,
+            selection_split=selection_split,
         )
 
         final_model_path = os.path.join(
@@ -2959,58 +3101,73 @@ class Rater(Algorithm):
             self.final_classifier,
         )
 
-        # Save ACTUAL EA-style gated weights for the final classifier.
-        final_train_scores = self._compute_scores(
-            train_dataset,
+        final_calibration_scores = self._compute_scores(
+            calibration_dataset,
             model=self.final_classifier,
         )
         torch.save(
-            final_train_scores,
+            final_calibration_scores,
             os.path.join(
                 output_dir,
-                f"rater_scores_{inner_split}_final_classifier.pt",
+                f"rater_scores_{calibration_split}_final_classifier.pt",
             ),
         )
 
-        final_val_scores = self._compute_scores(
-            val_dataset,
+        final_selection_scores = self._compute_scores(
+            selection_dataset,
             model=self.final_classifier,
         )
         torch.save(
-            final_val_scores,
+            final_selection_scores,
             os.path.join(
                 output_dir,
-                f"rater_scores_{outer_split}_final_classifier.pt",
+                f"rater_scores_{selection_split}_final_classifier.pt",
             ),
         )
 
-        final_val_metrics = self._evaluate_classifier(
+        final_calibration_metrics = self._evaluate_classifier(
             self.final_classifier,
-            val_dataset,
+            calibration_dataset,
+        )
+
+        final_selection_metrics = self._evaluate_classifier(
+            self.final_classifier,
+            selection_dataset,
         )
 
         log(
-            f"[Rater FINAL VAL] "
-            f"loss={final_val_metrics['loss']:.6f}, "
-            f"acc={100.0 * final_val_metrics['accuracy']:.2f}%, "
-            f"WGA={100.0 * final_val_metrics['worst_group_accuracy']:.2f}%"
+            f"[Rater FINAL CALIBRATION] "
+            f"loss={final_calibration_metrics['loss']:.6f}, "
+            f"acc={100.0 * final_calibration_metrics['accuracy']:.2f}%, "
+            f"WGA="
+            f"{100.0 * final_calibration_metrics['worst_group_accuracy']:.2f}%"
         )
 
-        for gid, acc in final_val_metrics["group_accuracy"].items():
+        log(
+            f"[Rater FINAL SELECTION] "
+            f"loss={final_selection_metrics['loss']:.6f}, "
+            f"acc={100.0 * final_selection_metrics['accuracy']:.2f}%, "
+            f"WGA="
+            f"{100.0 * final_selection_metrics['worst_group_accuracy']:.2f}%"
+        )
+
+        for gid, acc in final_selection_metrics["group_accuracy"].items():
             log(
-                f"[Rater FINAL VAL] group {gid}: "
+                f"[Rater FINAL SELECTION] group {gid}: "
                 f"{100.0 * acc:.2f}%"
             )
 
-        final_val_relationship = self._classifier_score_loss_relationship(
-            val_dataset,
-            self.final_classifier,
+        final_selection_relationship = (
+            self._classifier_score_loss_relationship(
+                selection_dataset,
+                self.final_classifier,
+            )
         )
         self._save_all_score_diagnostics(
-            relationship=final_val_relationship,
+            relationship=final_selection_relationship,
             output_dir=output_dir,
             meta_step=self.meta_steps,
-            split_name=f"{outer_split}_final_classifier",
+            split_name=f"{selection_split}_final_classifier",
             tag_prefix="final",
         )
 
