@@ -126,6 +126,19 @@ class Examine(Algorithm):
       EXAMINE_CLASS_MEAN_PENALTY=0.0
       EXAMINE_SANITY_CHECK=1|0                        default 1
 
+      # Inference-only mapping from raw predicted utility to a stable rating/weight:
+      EXAMINE_RATING_TEMPERATURE=1.0
+      EXAMINE_WEIGHT_SCALE=2.0
+
+    For any new frozen embedding z, after training:
+        raw_score = Rater(z)
+        rating    = sigmoid(raw_score / rating_temperature)   in (0,1)
+        weight    = weight_scale * rating                     in (0,scale)
+
+    With the recommended within_class target normalization, utility target 0 is
+    neutral, therefore raw_score ~= 0 -> rating ~= 0.5 -> weight ~= 1 when
+    EXAMINE_WEIGHT_SCALE=2.0.
+
     Recommended Waterbirds protocol:
       train_no_aug -> inner model training
       val_subset1  -> outer gradient defining utility
@@ -177,6 +190,16 @@ class Examine(Algorithm):
         self.class_mean_penalty = float(os.environ.get("EXAMINE_CLASS_MEAN_PENALTY", "0.0"))
         self.sanity_check = _env_bool("EXAMINE_SANITY_CHECK", True)
 
+        # Stable inference mapping for unseen examples. This mapping is NOT
+        # used to train the Rater; it is only how we convert the learned
+        # predicted utility score into a human-friendly rating/weight.
+        self.rating_temperature = float(
+            os.environ.get("EXAMINE_RATING_TEMPERATURE", "1.0")
+        )
+        self.weight_scale = float(
+            os.environ.get("EXAMINE_WEIGHT_SCALE", "2.0")
+        )
+
         if self.utility_mode not in {"dot", "cosine"}:
             raise ValueError("EXAMINE_UTILITY_MODE must be dot or cosine.")
         if self.target_norm not in {"none", "batch", "within_class"}:
@@ -185,6 +208,10 @@ class Examine(Algorithm):
             raise ValueError("EXAMINE_RATER_INPUT must be raw or class_centered.")
         if self.regression_loss not in {"huber", "mse"}:
             raise ValueError("EXAMINE_REGRESSION_LOSS must be huber or mse.")
+        if self.rating_temperature <= 0:
+            raise ValueError("EXAMINE_RATING_TEMPERATURE must be > 0.")
+        if self.weight_scale <= 0:
+            raise ValueError("EXAMINE_WEIGHT_SCALE must be > 0.")
 
         if self.rater_capacity == "small":
             self.rater = EmbeddingRaterSmall(self.feature_dim).to(self.device)
@@ -204,6 +231,10 @@ class Examine(Algorithm):
         log(f"[EXAMINE] utility={self.utility_mode}, target_norm={self.target_norm}, "
             f"class_balanced_outer={self.class_balanced_outer}")
         log(f"[EXAMINE] rater_input={self.rater_input_mode}, regression={self.regression_loss}")
+        log(
+            f"[EXAMINE] inference mapping: rating=sigmoid(score/{self.rating_temperature}), "
+            f"weight={self.weight_scale}*rating"
+        )
         log("[EXAMINE] Group/background labels are diagnostics only.")
         log("=" * 90)
 
@@ -493,7 +524,65 @@ class Examine(Algorithm):
             "spearman_raw": _corr(p, r, "spearman"),
         }
 
-    # ---------------- score diagnostics ----------------
+    # ---------------- score / rating / weight diagnostics ----------------
+
+    def _raw_score_to_rating_weight(self, raw_score):
+        """
+        Stable inference mapping for any seen or unseen embedding.
+
+        The Rater itself predicts signed gradient utility. With the default
+        within-class standardized utility target, score=0 is the natural
+        neutral point. Therefore:
+
+            rating = sigmoid(score / T)          in (0, 1)
+            weight = scale * rating              in (0, scale)
+
+        With scale=2, score=0 maps to weight=1.
+        """
+        rating = torch.sigmoid(
+            raw_score / self.rating_temperature
+        )
+        weight = self.weight_scale * rating
+        return rating, weight
+
+    @torch.no_grad()
+    def rate_embeddings(self, z, y=None):
+        """
+        Public inference helper for NEW embeddings.
+
+        Parameters
+        ----------
+        z : Tensor [N, feature_dim]
+            Frozen ResNet embeddings.
+        y : Optional Tensor [N]
+            Needed only when EXAMINE_RATER_INPUT=class_centered.
+
+        Returns
+        -------
+        dict with raw_score, rating, weight.
+        """
+        self.rater.eval()
+        z = z.to(self.device)
+
+        if self.rater_input_mode == "class_centered":
+            if y is None:
+                raise ValueError(
+                    "rate_embeddings(...): y is required when "
+                    "EXAMINE_RATER_INPUT=class_centered."
+                )
+            y = y.to(self.device)
+            rater_input = self._rater_input(z, y)
+        else:
+            rater_input = z
+
+        raw_score = self.rater(rater_input)
+        rating, weight = self._raw_score_to_rating_weight(raw_score)
+
+        return {
+            "raw_score": raw_score,
+            "rating": rating,
+            "weight": weight,
+        }
 
     @torch.no_grad()
     def _scores(self, dataset):
@@ -504,18 +593,36 @@ class Examine(Algorithm):
             num_workers=self.config.num_workers,
             pin_memory=True,
         )
-        scores, labels, groups, attrs = [], [], [], []
+
+        raw_scores = []
+        ratings = []
+        weights = []
+        labels = []
+        groups = []
+        attrs = []
+
         self.rater.eval()
+
         for z, y, g, a in loader:
             z = z.to(self.device, non_blocking=True)
             yd = y.to(self.device, non_blocking=True)
-            s = self.rater(self._rater_input(z, yd))
-            scores.append(s.cpu())
+
+            if self.rater_input_mode == "class_centered":
+                result = self.rate_embeddings(z, yd)
+            else:
+                result = self.rate_embeddings(z)
+
+            raw_scores.append(result["raw_score"].detach().cpu())
+            ratings.append(result["rating"].detach().cpu())
+            weights.append(result["weight"].detach().cpu())
             labels.append(y.cpu())
             groups.append(g.cpu())
             attrs.append(a.cpu())
+
         return {
-            "scores": torch.cat(scores),
+            "scores": torch.cat(raw_scores),
+            "ratings": torch.cat(ratings),
+            "weights": torch.cat(weights),
             "labels": torch.cat(labels),
             "groups": torch.cat(groups),
             "attrs": torch.cat(attrs),
@@ -523,53 +630,268 @@ class Examine(Algorithm):
 
     @staticmethod
     def _summary(payload):
-        s, y, g = payload["scores"], payload["labels"], payload["groups"]
+        s = payload["scores"]
+        r = payload["ratings"]
+        w = payload["weights"]
+        y = payload["labels"]
+        g = payload["groups"]
+
         lines = [
-            f"score mean={s.mean():.6f}, std={s.std(unbiased=False):.6f}, "
-            f"min={s.min():.6f}, max={s.max():.6f}"
+            (
+                f"raw score mean={s.mean():.6f}, "
+                f"std={s.std(unbiased=False):.6f}, "
+                f"min={s.min():.6f}, max={s.max():.6f}"
+            ),
+            (
+                f"rating mean={r.mean():.6f}, "
+                f"std={r.std(unbiased=False):.6f}, "
+                f"min={r.min():.6f}, max={r.max():.6f}"
+            ),
+            (
+                f"weight mean={w.mean():.6f}, "
+                f"std={w.std(unbiased=False):.6f}, "
+                f"min={w.min():.6f}, max={w.max():.6f}"
+            ),
         ]
-        cm, gm = {}, {}
+
+        class_score_means = {}
+        class_rating_means = {}
+        class_weight_means = {}
+        group_score_means = {}
+        group_rating_means = {}
+        group_weight_means = {}
+
         for c in torch.unique(y):
             mask = y == c
-            cm[int(c)] = float(s[mask].mean())
-            lines.append(f"class {int(c)}: n={int(mask.sum())}, mean_score={cm[int(c)]:.6f}")
-        for gid in torch.unique(g):
-            mask = g == gid
-            gm[int(gid)] = float(s[mask].mean())
-            lines.append(f"group {int(gid)}: n={int(mask.sum())}, mean_score={gm[int(gid)]:.6f}")
-        if 0 in cm and 1 in cm:
-            lines.append(f"CLASS GAP |y1-y0|={abs(cm[1]-cm[0]):.6f}")
-        if all(k in gm for k in (0, 1, 2, 3)):
-            lines.append(f"WITHIN-CLASS GAP y0 (g1-g0)={gm[1]-gm[0]:.6f}")
-            lines.append(f"WITHIN-CLASS GAP y1 (g2-g3)={gm[2]-gm[3]:.6f}")
+            cid = int(c)
+            class_score_means[cid] = float(s[mask].mean())
+            class_rating_means[cid] = float(r[mask].mean())
+            class_weight_means[cid] = float(w[mask].mean())
+
+            lines.append(
+                f"class {cid}: n={int(mask.sum())}, "
+                f"mean_score={class_score_means[cid]:.6f}, "
+                f"mean_rating={class_rating_means[cid]:.6f}, "
+                f"mean_weight={class_weight_means[cid]:.6f}"
+            )
+
+        for gid_tensor in torch.unique(g):
+            mask = g == gid_tensor
+            gid = int(gid_tensor)
+            group_score_means[gid] = float(s[mask].mean())
+            group_rating_means[gid] = float(r[mask].mean())
+            group_weight_means[gid] = float(w[mask].mean())
+
+            lines.append(
+                f"group {gid}: n={int(mask.sum())}, "
+                f"mean_score={group_score_means[gid]:.6f}, "
+                f"mean_rating={group_rating_means[gid]:.6f}, "
+                f"mean_weight={group_weight_means[gid]:.6f}"
+            )
+
+        if 0 in class_score_means and 1 in class_score_means:
+            lines.append(
+                "CLASS GAP score |y1-y0|="
+                f"{abs(class_score_means[1]-class_score_means[0]):.6f}"
+            )
+            lines.append(
+                "CLASS GAP rating |y1-y0|="
+                f"{abs(class_rating_means[1]-class_rating_means[0]):.6f}"
+            )
+
+        if all(k in group_score_means for k in (0, 1, 2, 3)):
+            lines.append(
+                "WITHIN-CLASS SCORE GAP y0 (g1-g0)="
+                f"{group_score_means[1]-group_score_means[0]:.6f}"
+            )
+            lines.append(
+                "WITHIN-CLASS SCORE GAP y1 (g2-g3)="
+                f"{group_score_means[2]-group_score_means[3]:.6f}"
+            )
+            lines.append(
+                "WITHIN-CLASS RATING GAP y0 (g1-g0)="
+                f"{group_rating_means[1]-group_rating_means[0]:.6f}"
+            )
+            lines.append(
+                "WITHIN-CLASS RATING GAP y1 (g2-g3)="
+                f"{group_rating_means[2]-group_rating_means[3]:.6f}"
+            )
+
         return lines
 
-    def _plot_scores(self, payload, output_dir, split, step):
-        d = os.path.join(output_dir, "plots", "examine_raw_score_histogram")
-        os.makedirs(d, exist_ok=True)
+    def _save_score_table(self, payload, output_dir, split, step):
+        table_dir = os.path.join(
+            output_dir,
+            "tables",
+            "examine_score_rating_weight",
+        )
+        os.makedirs(table_dir, exist_ok=True)
+
+        path = os.path.join(
+            table_dir,
+            f"step_{step:06d}_{split}_scores.csv",
+        )
+
         s = payload["scores"].numpy()
+        r = payload["ratings"].numpy()
+        w = payload["weights"].numpy()
+        y = payload["labels"].numpy()
         g = payload["groups"].numpy()
+        a = payload["attrs"].numpy()
+
+        with open(path, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                "index",
+                "label",
+                "group",
+                "attr",
+                "raw_score",
+                "rating_0_to_1",
+                "weight",
+            ])
+
+            for i in range(len(s)):
+                writer.writerow([
+                    i,
+                    int(y[i]),
+                    int(g[i]),
+                    int(a[i]),
+                    float(s[i]),
+                    float(r[i]),
+                    float(w[i]),
+                ])
+
+        log(f"[EXAMINE table] {path}")
+        return path
+
+    def _plot_one_distribution(
+        self,
+        values,
+        groups,
+        output_dir,
+        subdir,
+        split,
+        step,
+        xlabel,
+        title_prefix,
+        filename_suffix,
+        xlim=None,
+        neutral=None,
+    ):
+        d = os.path.join(
+            output_dir,
+            "plots",
+            subdir,
+        )
+        os.makedirs(d, exist_ok=True)
+
         names = {
             0: "Group 0: landbird / land",
             1: "Group 1: landbird / water",
             2: "Group 2: waterbird / land",
             3: "Group 3: waterbird / water",
         }
+
         fig, ax = plt.subplots(figsize=(11, 7))
-        for gid in sorted(np.unique(g)):
-            mask = g == gid
-            ax.hist(s[mask], bins=35, density=True, alpha=0.45,
-                    label=f"{names.get(int(gid), f'Group {gid}')} (n={int(mask.sum())})")
-        ax.set_xlabel("Raw EXAMINE Rater score")
+
+        for gid in sorted(np.unique(groups)):
+            mask = groups == gid
+            ax.hist(
+                values[mask],
+                bins=35,
+                density=True,
+                alpha=0.45,
+                label=(
+                    f"{names.get(int(gid), f'Group {gid}')} "
+                    f"(n={int(mask.sum())})"
+                ),
+            )
+
+        if neutral is not None:
+            ax.axvline(
+                neutral,
+                linestyle="--",
+                linewidth=1.2,
+                label=f"neutral={neutral:g}",
+            )
+
+        if xlim is not None:
+            ax.set_xlim(*xlim)
+
+        ax.set_xlabel(xlabel)
         ax.set_ylabel("Density")
-        ax.set_title(f"Gradient-utility Rater scores by group | {split} | step {step}")
+        ax.set_title(
+            f"{title_prefix} by group | {split} | step {step}"
+        )
         ax.legend(fontsize=9)
         ax.grid(True, linestyle=":", alpha=0.3)
         fig.tight_layout()
-        path = os.path.join(d, f"step_{step:06d}_{split}_raw_score_hist.png")
+
+        path = os.path.join(
+            d,
+            f"step_{step:06d}_{split}_{filename_suffix}.png",
+        )
         fig.savefig(path, dpi=160, bbox_inches="tight")
         plt.close(fig)
         log(f"[EXAMINE plot] {path}")
+        return path
+
+    def _plot_scores(self, payload, output_dir, split, step):
+        s = payload["scores"].numpy()
+        r = payload["ratings"].numpy()
+        w = payload["weights"].numpy()
+        g = payload["groups"].numpy()
+
+        self._plot_one_distribution(
+            s,
+            g,
+            output_dir,
+            "examine_raw_score_histogram",
+            split,
+            step,
+            xlabel="Raw predicted gradient-utility score",
+            title_prefix="EXAMINE raw Rater score",
+            filename_suffix="raw_score_hist",
+            neutral=0.0,
+        )
+
+        self._plot_one_distribution(
+            r,
+            g,
+            output_dir,
+            "examine_rating_histogram",
+            split,
+            step,
+            xlabel="Rating = sigmoid(raw_score / T)",
+            title_prefix="EXAMINE rating",
+            filename_suffix="rating_hist",
+            xlim=(0.0, 1.0),
+            neutral=0.5,
+        )
+
+        self._plot_one_distribution(
+            w,
+            g,
+            output_dir,
+            "examine_weight_histogram",
+            split,
+            step,
+            xlabel=(
+                f"Weight = {self.weight_scale:g} * rating"
+            ),
+            title_prefix="EXAMINE inferred weight",
+            filename_suffix="weight_hist",
+            xlim=(0.0, self.weight_scale),
+            neutral=(self.weight_scale / 2.0),
+        )
+
+        self._save_score_table(
+            payload,
+            output_dir,
+            split,
+            step,
+        )
 
     # ---------------- checkpoint ----------------
 
@@ -588,6 +910,8 @@ class Examine(Algorithm):
             "target_norm": self.target_norm,
             "rater_input_mode": self.rater_input_mode,
             "regression_loss": self.regression_loss,
+            "rating_temperature": self.rating_temperature,
+            "weight_scale": self.weight_scale,
         }, path)
 
     def _load_checkpoint(self, path):
@@ -706,12 +1030,36 @@ class Examine(Algorithm):
         self.rater.eval()
         log(f"[EXAMINE] Restored BEST step={best_step}, selection_utility_loss={best_loss:.6f}")
 
-        for name, ds in ((selection_split, select_ds), ("test", test_ds)):
+        # Save comprehensive outputs from the RESTORED BEST Rater.
+        # These are the files to inspect before training any final classifier.
+        for name, ds in (
+            (inner_split, train_ds),
+            (outer_split, outer_ds),
+            (selection_split, select_ds),
+            ("test", test_ds),
+        ):
             if ds is None:
                 continue
+
             payload = self._scores(ds)
-            torch.save(payload, os.path.join(output_dir, f"examine_scores_{name}.pt"))
-            self._plot_scores(payload, output_dir, name, best_step)
+
+            torch.save(
+                payload,
+                os.path.join(
+                    output_dir,
+                    f"examine_scores_ratings_weights_{name}.pt",
+                ),
+            )
+
+            for line in self._summary(payload):
+                log(f"[EXAMINE/BEST/{name}] {line}")
+
+            self._plot_scores(
+                payload,
+                output_dir,
+                name,
+                best_step,
+            )
 
     # ---------------- test hook ----------------
 
@@ -731,12 +1079,28 @@ class Examine(Algorithm):
         for sp in split:
             ds = self._embedding_dataset(sp, cache_dir)
             payload = self._scores(ds)
-            path = os.path.join(output_dir, f"examine_scores_{sp}.pt")
+            path = os.path.join(
+                output_dir,
+                f"examine_scores_ratings_weights_{sp}.pt",
+            )
             torch.save(payload, path)
-            log(f"[EXAMINE] {sp} scores saved to {path}")
+            log(
+                f"[EXAMINE] {sp} scores/ratings/weights "
+                f"saved to {path}"
+            )
+
             summary = self._summary(payload)
             for line in summary:
                 log(f"[EXAMINE/{sp}] {line}")
+
+            # Also save the raw-score, rating, and inferred-weight
+            # histograms plus per-example CSV whenever test() is called.
+            self._plot_scores(
+                payload,
+                output_dir,
+                sp,
+                0,
+            )
             if result_path:
                 with open(result_path, "a") as f:
                     f.write(f"EXAMINE {sp}\n")
