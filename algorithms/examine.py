@@ -59,7 +59,10 @@ Additional potentially useful signals are also saved:
     logit margin
     correctness
     cosine(sample gradient, split mean gradient)
+        g_bar_split = (1/N) sum_j g_j
+
     cosine(sample gradient, same-class mean gradient)
+        g_bar_class(i) = (1/N_y) sum_{j: y_j = y_i} g_j
     within-class z-score of parameter-gradient magnitude
     within-class percentile of parameter-gradient magnitude
 
@@ -312,6 +315,7 @@ class Examine(Algorithm):
                 "feature_grad_norm,"
                 "logit_grad_norm,"
                 "grad_cos_split_mean,"
+                "grad_cos_class_mean,"
                 "param_grad_norm_within_class_z,"
                 "loss"
             ),
@@ -999,8 +1003,21 @@ class Examine(Algorithm):
     ):
         """
         Second pass:
-          cosine/dot product of each sample's exact parameter gradient
-          with the split-mean gradient and same-class mean gradient.
+
+          A) SPLIT-MEAN alignment
+             g_bar_split = (1/N) sum_j g_j
+
+             grad_cos_split_mean[i]
+                 = cos(g_i, g_bar_split)
+
+          B) SAME-CLASS-MEAN alignment
+             g_bar_class(i)
+                 = (1/N_y) sum_{j: y_j = y_i} g_j
+
+             grad_cos_class_mean[i]
+                 = cos(g_i, g_bar_class(i))
+
+        Both are diagnostics only. Neither one changes training.
         """
 
         loader = DataLoader(
@@ -1960,6 +1977,7 @@ class Examine(Algorithm):
             "feature_grad_norm",
             "logit_grad_norm",
             "grad_cos_split_mean",
+            "grad_cos_class_mean",
             "param_grad_norm_within_class_z",
             "loss",
         ]
@@ -2396,7 +2414,9 @@ class Examine(Algorithm):
                 f"logit_grad_mean="
                 f"{metrics['logit_grad_norm'][mask].mean():.6f}, "
                 f"mean_cos_to_split_grad="
-                f"{metrics['grad_cos_split_mean'][mask].mean():.6f}"
+                f"{metrics['grad_cos_split_mean'][mask].mean():.6f}, "
+                f"mean_cos_to_same_class_grad="
+                f"{metrics['grad_cos_class_mean'][mask].mean():.6f}"
             )
 
         self._save_per_sample_csv(
