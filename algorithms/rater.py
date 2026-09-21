@@ -320,6 +320,69 @@ class Rater(Algorithm):
         self.score_reg_weight = float(
             getattr(self.config, "rater_score_reg_weight", 0.0)
         )
+
+        # ----------------------------------------------------
+        # NEW: gradient-magnitude auxiliary Rater loss.
+        #
+        # For every training sample i and current inner classifier:
+        #
+        #   G_i = || d CE_i / d(W,b) ||_2
+        #
+        # G_i is converted to a percentile WITHIN ITS OWN CLASS:
+        #
+        #   q_i = Percentile(G_i | y_i)
+        #
+        # The Rater's bounded auxiliary prediction is:
+        #
+        #   r_i = sigmoid(raw_rater_score_i)
+        #
+        # and:
+        #
+        #   L_grad = mean_i (r_i - q_i)^2
+        #
+        # Total meta objective:
+        #
+        #   L_total = L_outer + lambda_g * L_grad + regularizers
+        #
+        # lambda_g is controlled from Colab through:
+        #
+        #   RATER_GRAD_LOSS_WEIGHT
+        #
+        # so config.py does NOT need a new CLI argument.
+        # ----------------------------------------------------
+        self.grad_loss_weight = float(
+            os.environ.get(
+                "RATER_GRAD_LOSS_WEIGHT",
+                str(
+                    getattr(
+                        self.config,
+                        "rater_grad_loss_weight",
+                        1.0,
+                    )
+                ),
+            )
+        )
+
+        # This experiment intentionally rates ALL examples.
+        self.rate_all_samples = (
+            os.environ.get(
+                "RATER_RATE_ALL_SAMPLES",
+                "1",
+            ).strip().lower()
+            in {"1", "true", "yes", "y"}
+        )
+
+        if not self.rate_all_samples:
+            raise ValueError(
+                "This gradient-percentile Rater experiment requires "
+                "RATER_RATE_ALL_SAMPLES=1."
+            )
+
+        if self.grad_loss_weight < 0:
+            raise ValueError(
+                "RATER_GRAD_LOSS_WEIGHT / lambda_g must be >= 0."
+            )
+
         self.rater_capacity = getattr(
             self.config, "rater_capacity", "medium"
         )
@@ -440,16 +503,25 @@ class Rater(Algorithm):
         self.final_classifier = None
 
         log(
-            f"[Rater] Misclassified-sample Rater transform = "
+            f"[Rater] ALL-SAMPLE Rater transform = "
             f"{self.weighting}; temperature = {self.temperature}"
         )
         log(
-            "[Rater] EA-style gating enabled: correct samples get "
-            "weight=1; only misclassified samples use the Rater."
+            "[Rater] ALL samples are rated and weighted by the Rater; "
+            "there is NO correct/misclassified gate."
         )
         log(
-            "[Rater] Inner objective remains L_inner = sum_i w_i * CE_i "
+            "[Rater] Inner objective: L_inner = sum_i w_i * CE_i "
             "WITHOUT dividing by sum(w)."
+        )
+        log(
+            f"[Rater] Gradient auxiliary loss: "
+            f"L_total = L_outer + lambda_g * L_grad, "
+            f"lambda_g={self.grad_loss_weight:.6f}"
+        )
+        log(
+            "[Rater] L_grad target = within-class percentile of exact "
+            "per-sample classifier parameter-gradient magnitude."
         )
 
         if self.config.check_point:
@@ -892,6 +964,43 @@ class Rater(Algorithm):
             standardized_scores / self.temperature
         )
 
+    def _all_sample_training_weights(
+        self,
+        z,
+        y,
+        logits,
+        raw_scores_all=None,
+    ):
+        """
+        Rate EVERY sample.
+
+        Correct examples are NOT forced to weight 1.
+
+            raw_i = Rater(z_i)
+            w_i   = transform(raw_i)
+
+        `correct_mask` is returned only for diagnostics.
+        """
+        if raw_scores_all is None:
+            raw_scores = self.rater(z)
+        else:
+            raw_scores = raw_scores_all
+
+        weights = self._scores_to_weights(
+            raw_scores
+        )
+
+        correct_mask = (
+            logits.argmax(dim=1).eq(y)
+        )
+
+        return (
+            weights,
+            correct_mask,
+            raw_scores,
+        )
+
+
     def _ea_style_training_weights(
         self,
         z,
@@ -900,90 +1009,268 @@ class Rater(Algorithm):
         raw_scores_all=None,
     ):
         """
-        Build effective sample weights:
+        Backward-compatible alias.
 
-            weight_i = 1
-                if argmax(logits_i) == y_i
-
-            weight_i = RaterRating(z_i)
-                otherwise
-
-        During actual training `raw_scores_all` is None, so the Rater is
-        called ONLY for misclassified samples. For diagnostics, optional
-        precomputed raw scores can be supplied.
+        In this experiment this NO LONGER performs EA-style
+        correct/wrong gating. It delegates to the ALL-SAMPLE rule.
         """
-
-        pred = logits.argmax(dim=1)
-        correct_mask = pred.eq(y)
-        misclassified_mask = ~correct_mask
-
-        weights = torch.ones(
-            y.shape[0],
-            device=logits.device,
-            dtype=logits.dtype,
+        return self._all_sample_training_weights(
+            z=z,
+            y=y,
+            logits=logits,
+            raw_scores_all=raw_scores_all,
         )
-
-        if not bool(misclassified_mask.any()):
-            empty_scores = torch.empty(
-                0,
-                device=logits.device,
-                dtype=logits.dtype,
-            )
-            return weights, correct_mask, empty_scores
-
-        misclassified_indices = torch.nonzero(
-            misclassified_mask,
-            as_tuple=False,
-        ).squeeze(1)
-
-        if raw_scores_all is None:
-            misclassified_raw_scores = self.rater(
-                z[misclassified_mask]
-            )
-        else:
-            misclassified_raw_scores = raw_scores_all[
-                misclassified_mask
-            ]
-
-        misclassified_ratings = self._scores_to_weights(
-            misclassified_raw_scores
-        )
-
-        weights = weights.index_copy(
-            0,
-            misclassified_indices,
-            misclassified_ratings,
-        )
-
-        return weights, correct_mask, misclassified_raw_scores
 
     # ========================================================
     # Differentiable inner optimization
     # ========================================================
 
-    def _inner_unroll(self, inner_model, train_iterator, train_loader):
-        """Perform differentiable EA-style weighted inner updates."""
+    @staticmethod
+    def _within_class_percentile_targets(
+        values,
+        labels,
+    ):
+        """
+        Percentile-rank scalar values independently within each class.
 
-        fast_weight = (
-            inner_model.linear.weight.detach().clone().requires_grad_(True)
+        Output:
+            target in [0, 1]
+
+        If only one example of a class is present in a minibatch,
+        that sample gets the neutral target 0.5.
+        """
+        with torch.no_grad():
+            targets = torch.empty_like(
+                values,
+                dtype=torch.float32,
+            )
+
+            for class_id in torch.unique(
+                labels
+            ):
+                mask = labels.eq(
+                    class_id
+                )
+
+                class_values = values[
+                    mask
+                ]
+
+                n = class_values.numel()
+
+                if n == 1:
+                    class_targets = torch.full_like(
+                        class_values,
+                        0.5,
+                        dtype=torch.float32,
+                    )
+                else:
+                    order = torch.argsort(
+                        class_values,
+                        stable=True,
+                    )
+
+                    ranks = torch.empty(
+                        n,
+                        device=values.device,
+                        dtype=torch.float32,
+                    )
+
+                    ranks[
+                        order
+                    ] = torch.linspace(
+                        0.0,
+                        1.0,
+                        steps=n,
+                        device=values.device,
+                        dtype=torch.float32,
+                    )
+
+                    class_targets = ranks
+
+                targets[
+                    mask
+                ] = class_targets
+
+            return targets
+
+
+    @torch.no_grad()
+    def _per_sample_param_grad_norm(
+        self,
+        z,
+        y,
+        logits,
+    ):
+        """
+        Exact per-sample parameter-gradient magnitude of the CURRENT
+        linear classifier.
+
+        logits_i = W z_i + b
+
+        delta_i = softmax(logits_i) - onehot(y_i)
+
+        dL_i/dW = delta_i outer z_i
+        dL_i/db = delta_i
+
+        Thus:
+
+            ||dL_i/d(W,b)||_2
+                = ||delta_i||_2 * sqrt(||z_i||_2^2 + 1)
+        """
+        probs = torch.softmax(
+            logits.detach(),
+            dim=1,
         )
+
+        onehot = F.one_hot(
+            y,
+            num_classes=self.n_classes,
+        ).to(
+            probs.dtype
+        )
+
+        delta = (
+            probs - onehot
+        )
+
+        delta_norm = torch.linalg.vector_norm(
+            delta,
+            ord=2,
+            dim=1,
+        )
+
+        z_norm_sq = (
+            z.detach()
+            .pow(2)
+            .sum(dim=1)
+        )
+
+        return (
+            delta_norm
+            * torch.sqrt(
+                z_norm_sq + 1.0
+            )
+        )
+
+
+    def _gradient_percentile_mse(
+        self,
+        raw_scores,
+        z,
+        y,
+        logits,
+    ):
+        """
+        Auxiliary Rater supervision.
+
+            G_i = exact per-sample parameter-gradient norm
+            q_i = within-class percentile of G_i
+            r_i = sigmoid(raw_rater_score_i)
+
+            L_grad = mean_i (r_i - q_i)^2
+
+        ALL samples contribute.
+        Group/background labels are never used.
+        """
+        grad_norm = (
+            self._per_sample_param_grad_norm(
+                z=z,
+                y=y,
+                logits=logits,
+            )
+        )
+
+        target = (
+            self._within_class_percentile_targets(
+                grad_norm,
+                y,
+            )
+        )
+
+        prediction = torch.sigmoid(
+            raw_scores
+        )
+
+        grad_mse = F.mse_loss(
+            prediction,
+            target,
+            reduction="mean",
+        )
+
+        return (
+            grad_mse,
+            grad_norm.detach(),
+            target.detach(),
+            prediction,
+        )
+
+
+    def _inner_unroll(
+        self,
+        inner_model,
+        train_iterator,
+        train_loader,
+    ):
+        """
+        Differentiable ALL-SAMPLE weighted inner optimization.
+
+        Inner classifier:
+            L_inner = sum_i w_i * CE_i
+
+        Rater auxiliary target:
+            L_grad = MSE(
+                sigmoid(Rater(z_i)),
+                within_class_percentile(||grad_i||)
+            )
+
+        L_grad is returned to the meta step; it is NOT part of the
+        inner-classifier objective.
+        """
+        fast_weight = (
+            inner_model.linear.weight
+            .detach()
+            .clone()
+            .requires_grad_(True)
+        )
+
         fast_bias = (
-            inner_model.linear.bias.detach().clone().requires_grad_(True)
+            inner_model.linear.bias
+            .detach()
+            .clone()
+            .requires_grad_(True)
         )
 
         last_raw_scores = None
+        grad_aux_losses = []
 
-        for _ in range(self.inner_steps):
-            batch, train_iterator = self._next_batch(
-                train_iterator, train_loader
+        for _ in range(
+            self.inner_steps
+        ):
+            batch, train_iterator = (
+                self._next_batch(
+                    train_iterator,
+                    train_loader,
+                )
             )
-            z, y, _, _ = batch
-            z = z.to(self.device, non_blocking=True)
-            y = y.to(self.device, non_blocking=True)
 
-            # Predict first. The current prediction determines whether the
-            # example gets weight 1 or a Rater-derived rating.
-            logits = F.linear(z, fast_weight, fast_bias)
+            z, y, _, _ = batch
+
+            z = z.to(
+                self.device,
+                non_blocking=True,
+            )
+
+            y = y.to(
+                self.device,
+                non_blocking=True,
+            )
+
+            logits = F.linear(
+                z,
+                fast_weight,
+                fast_bias,
+            )
 
             per_sample_loss = F.cross_entropy(
                 logits,
@@ -991,19 +1278,35 @@ class Rater(Algorithm):
                 reduction="none",
             )
 
-            weights, _, misclassified_raw_scores = (
-                self._ea_style_training_weights(
-                    z=z,
-                    y=y,
-                    logits=logits,
-                    raw_scores_all=None,
-                )
+            # ALL samples receive a Rater score.
+            raw_scores = self.rater(
+                z
             )
 
-            # Correct -> 1; wrong -> Rater rating.
-            # No division by sum(weights).
+            weights = self._scores_to_weights(
+                raw_scores
+            )
+
+            (
+                grad_mse,
+                _,
+                _,
+                _,
+            ) = self._gradient_percentile_mse(
+                raw_scores=raw_scores,
+                z=z,
+                y=y,
+                logits=logits,
+            )
+
+            grad_aux_losses.append(
+                grad_mse
+            )
+
+            # No division by weights.sum().
             inner_loss = (
-                per_sample_loss * weights
+                per_sample_loss
+                * weights
             ).sum()
 
             if self.inner_reg_weight > 0:
@@ -1011,27 +1314,51 @@ class Rater(Algorithm):
                     fast_weight.pow(2).sum()
                     + fast_bias.pow(2).sum()
                 )
+
                 inner_loss = (
                     inner_loss
-                    + self.inner_reg_weight * inner_reg
+                    + self.inner_reg_weight
+                    * inner_reg
                 )
 
             grad_w, grad_b = torch.autograd.grad(
                 inner_loss,
-                [fast_weight, fast_bias],
+                [
+                    fast_weight,
+                    fast_bias,
+                ],
                 create_graph=True,
             )
 
-            fast_weight = fast_weight - self.inner_lr * grad_w
-            fast_bias = fast_bias - self.inner_lr * grad_b
-            last_raw_scores = misclassified_raw_scores
+            fast_weight = (
+                fast_weight
+                - self.inner_lr
+                * grad_w
+            )
+
+            fast_bias = (
+                fast_bias
+                - self.inner_lr
+                * grad_b
+            )
+
+            last_raw_scores = raw_scores
 
         fast_params = {
             "weight": fast_weight,
             "bias": fast_bias,
         }
 
-        return fast_params, train_iterator, last_raw_scores
+        mean_grad_mse = torch.stack(
+            grad_aux_losses
+        ).mean()
+
+        return (
+            fast_params,
+            train_iterator,
+            last_raw_scores,
+            mean_grad_mse,
+        )
 
     # ========================================================
     # One bilevel/meta step
@@ -1044,20 +1371,48 @@ class Rater(Algorithm):
         train_loader,
         val_loader,
     ):
+        """
+        One Rater meta update.
+
+            L_total
+                = L_outer
+                + lambda_g * L_grad
+                + optional regularizers
+
+        L_grad is averaged across all inner steps and inner models.
+        """
         self.rater.train()
 
-        outer_batch, val_iterator = self._next_batch(
-            val_iterator, val_loader
+        outer_batch, val_iterator = (
+            self._next_batch(
+                val_iterator,
+                val_loader,
+            )
         )
+
         z_outer, y_outer, _, _ = outer_batch
-        z_outer = z_outer.to(self.device, non_blocking=True)
-        y_outer = y_outer.to(self.device, non_blocking=True)
+
+        z_outer = z_outer.to(
+            self.device,
+            non_blocking=True,
+        )
+
+        y_outer = y_outer.to(
+            self.device,
+            non_blocking=True,
+        )
 
         outer_losses = []
+        grad_mse_losses = []
         fast_parameter_sets = []
 
         for inner_model in self.inner_models:
-            fast_params, train_iterator, _ = self._inner_unroll(
+            (
+                fast_params,
+                train_iterator,
+                _,
+                grad_mse,
+            ) = self._inner_unroll(
                 inner_model,
                 train_iterator,
                 train_loader,
@@ -1068,35 +1423,67 @@ class Rater(Algorithm):
                 fast_params["weight"],
                 fast_params["bias"],
             )
+
             outer_loss = F.cross_entropy(
                 outer_logits,
                 y_outer,
             )
 
-            outer_losses.append(outer_loss)
-            fast_parameter_sets.append(fast_params)
+            outer_losses.append(
+                outer_loss
+            )
 
-        meta_loss = torch.stack(outer_losses).mean()
+            grad_mse_losses.append(
+                grad_mse
+            )
+
+            fast_parameter_sets.append(
+                fast_params
+            )
+
+        outer_ce = torch.stack(
+            outer_losses
+        ).mean()
+
+        grad_mse = torch.stack(
+            grad_mse_losses
+        ).mean()
+
+        meta_loss = (
+            outer_ce
+            + self.grad_loss_weight
+            * grad_mse
+        )
 
         if self.outer_reg_weight > 0:
             outer_reg = sum(
                 p.pow(2).sum()
                 for p in self.rater.parameters()
             )
+
             meta_loss = (
                 meta_loss
-                + self.outer_reg_weight * outer_reg
+                + self.outer_reg_weight
+                * outer_reg
             )
 
         if self.score_reg_weight > 0:
-            outer_scores = self.rater(z_outer)
-            score_reg = -torch.var(outer_scores)
+            outer_scores = self.rater(
+                z_outer
+            )
+
+            score_reg = -torch.var(
+                outer_scores
+            )
+
             meta_loss = (
                 meta_loss
-                + self.score_reg_weight * score_reg
+                + self.score_reg_weight
+                * score_reg
             )
 
         self.outer_optimizer.zero_grad()
+
         meta_loss.backward()
 
         if self.grad_clip > 0:
@@ -1107,21 +1494,26 @@ class Rater(Algorithm):
 
         self.outer_optimizer.step()
 
-        # Advance persistent inner models using detached fast parameters.
         with torch.no_grad():
-            for inner_model, fast_params in zip(
+            for (
+                inner_model,
+                fast_params,
+            ) in zip(
                 self.inner_models,
                 fast_parameter_sets,
             ):
                 inner_model.linear.weight.copy_(
                     fast_params["weight"].detach()
                 )
+
                 inner_model.linear.bias.copy_(
                     fast_params["bias"].detach()
                 )
 
         return (
             float(meta_loss.detach().item()),
+            float(outer_ce.detach().item()),
+            float(grad_mse.detach().item()),
             train_iterator,
             val_iterator,
         )
@@ -1308,7 +1700,7 @@ class Rater(Algorithm):
                 )
 
                 effective_weights, correct_mask, _ = (
-                    self._ea_style_training_weights(
+                    self._all_sample_training_weights(
                         z=z,
                         y=y_device,
                         logits=logits,
@@ -1579,11 +1971,11 @@ class Rater(Algorithm):
             values = np.asarray(relationship["final_scores"])
             folder = f"final_score_histogram_{self.weighting}"
             xlabel = (
-                "Effective EA-style training weight "
-                "(correct=1, wrong=Rater rating)"
+                "Effective ALL-SAMPLE Rater weight "
+                "(every sample=Rater weight)"
             )
             title_name = (
-                f"EA-style effective weight distribution "
+                f"ALL-SAMPLE Rater weight distribution "
                 f"(wrong uses {self.weighting})"
             )
             filename_kind = "final_score_hist"
@@ -1669,8 +2061,8 @@ class Rater(Algorithm):
         """
         Save group-colored scatter of FINAL SCORE vs classifier loss.
 
-        FINAL SCORE means the effective EA-style training weight:
-        correct -> 1; wrong -> Rater rating.
+        FINAL SCORE means the effective ALL-SAMPLE Rater weight:
+        every sample -> Rater weight.
         """
 
         final_scores = np.asarray(relationship["final_scores"])
@@ -1722,10 +2114,10 @@ class Rater(Algorithm):
             "Mean per-example cross-entropy loss across inner models"
         )
         ax.set_ylabel(
-            "Effective EA-style weight (correct=1, wrong=Rater rating)"
+            "Effective EA-style weight (every sample=Rater weight)"
         )
         ax.set_title(
-            f"EA-style effective weight vs inner-model loss "
+            f"ALL-SAMPLE Rater weight vs inner-model loss "
             f"(wrong uses {self.weighting}) | "
             f"{split_name} | "
             f"step {meta_step}\n"
@@ -1824,7 +2216,7 @@ class Rater(Algorithm):
             logits = model(z)
 
             effective_weights, correct_mask, _ = (
-                self._ea_style_training_weights(
+                self._all_sample_training_weights(
                     z=z,
                     y=y_device,
                     logits=logits,
@@ -1898,7 +2290,7 @@ class Rater(Algorithm):
     def _compute_scores(self, dataset, model=None):
         """
         Save raw Rater scores and, when a classifier is supplied, the
-        effective EA-style weights for that classifier.
+        effective ALL-SAMPLE Rater weights for that classifier.
         """
 
         loader = DataLoader(
@@ -1931,7 +2323,7 @@ class Rater(Algorithm):
             else:
                 logits = model(z)
                 batch_final_scores, correct_mask, _ = (
-                    self._ea_style_training_weights(
+                    self._all_sample_training_weights(
                         z=z,
                         y=y_device,
                         logits=logits,
@@ -1955,7 +2347,7 @@ class Rater(Algorithm):
             "labels": torch.cat(labels),
             "groups": torch.cat(groups),
             "attrs": torch.cat(attrs),
-            "weights_are_ea_style_gated": model is not None,
+            "weights_are_all_sample_rater": model is not None,
         }
 
     def _rating_summary(self, payload):
@@ -2012,25 +2404,51 @@ class Rater(Algorithm):
     # Checkpoints
     # ========================================================
 
-    def _save_rater_checkpoint(self, path, meta_step, outer_loss):
+    def _save_rater_checkpoint(
+        self,
+        path,
+        meta_step,
+        meta_loss,
+        outer_ce=None,
+        grad_mse=None,
+    ):
         torch.save(
             {
                 "rater_sd": self.rater.state_dict(),
-                "outer_optimizer_sd": self.outer_optimizer.state_dict(),
+                "outer_optimizer_sd": (
+                    self.outer_optimizer.state_dict()
+                ),
                 "meta_step": meta_step,
-                "outer_loss": outer_loss,
+                "meta_loss": meta_loss,
+
+                # Backward-compatible key.
+                "outer_loss": meta_loss,
+
+                "outer_ce": outer_ce,
+                "grad_mse": grad_mse,
+                "lambda_g": self.grad_loss_weight,
+
+                "gradient_target": (
+                    "within_class_percentile_of_param_grad_norm"
+                ),
+                "gradient_prediction": (
+                    "sigmoid_raw_rater_score"
+                ),
+                "rate_all_samples": True,
+
                 "feature_dim": self.feature_dim,
                 "backbone": self.config.backbone,
                 "pretrained": True,
                 "rater_capacity": self.rater_capacity,
                 "rater_weighting": self.weighting,
                 "rater_temperature": self.temperature,
-                "embedding_cache_root": self.embedding_cache_root,
+
+                "embedding_cache_root": (
+                    self.embedding_cache_root
+                ),
                 "embedding_cache_namespace": (
                     self._embedding_cache_namespace()
                 ),
-                "ea_style_correct_weight": 1.0,
-                "ea_style_rater_only_on_misclassified": True,
             },
             path,
         )
@@ -2210,80 +2628,129 @@ class Rater(Algorithm):
         split_name="train",
     ):
         """
-        Save histograms of the ACTUAL EA-style weights used during one
-        final-classifier training epoch.
+        Save ACTUAL ALL-SAMPLE Rater weights used during one
+        final-classifier epoch.
 
-        Effective weight:
-            correct sample -> 1
-            wrong sample   -> trained-Rater rating
-
-        Two plots are saved:
-          1) all effective weights;
-          2) only misclassified samples, where effective_weight is exactly
-             the trained Rater rating.
-
-        Values are recorded before each SGD update, so these are the weights
-        the final classifier actually saw.
+        Correctness is diagnostic only; it does not gate the weights.
         """
+        weights = np.asarray(
+            weights,
+            dtype=np.float64,
+        )
 
-        weights = np.asarray(weights, dtype=np.float64)
-        groups = np.asarray(groups, dtype=np.int64)
-        correctness = np.asarray(correctness, dtype=np.float64)
+        groups = np.asarray(
+            groups,
+            dtype=np.int64,
+        )
+
+        correctness = np.asarray(
+            correctness,
+            dtype=np.float64,
+        )
 
         if len(weights) == 0:
             return
 
-        correct_mask = correctness >= 0.5
-        wrong_mask = ~correct_mask
-
-        # Save numeric data
         data_dir = os.path.join(
             output_dir,
             "plots",
             "final_classifier_epoch_weight_data",
         )
-        os.makedirs(data_dir, exist_ok=True)
+
+        os.makedirs(
+            data_dir,
+            exist_ok=True,
+        )
 
         csv_path = os.path.join(
             data_dir,
             f"epoch_{epoch:03d}_{split_name}_weights.csv",
         )
 
-        with open(csv_path, "w", newline="") as f:
+        with open(
+            csv_path,
+            "w",
+            newline="",
+        ) as f:
             writer = csv.writer(f)
+
             writer.writerow(
                 [
                     "index",
-                    "effective_weight",
+                    "all_sample_rater_weight",
                     "group",
                     "correct_before_update",
-                    "misclassified_before_update",
                 ]
             )
-            for i in range(len(weights)):
+
+            for i in range(
+                len(weights)
+            ):
                 writer.writerow(
                     [
                         i,
                         float(weights[i]),
                         int(groups[i]),
-                        int(correct_mask[i]),
-                        int(wrong_mask[i]),
+                        int(correctness[i] >= 0.5),
                     ]
                 )
 
-        # Plot 1: all effective weights
         plot_dir = os.path.join(
             output_dir,
             "plots",
-            "final_classifier_epoch_effective_weight_histogram",
+            "final_classifier_epoch_all_sample_weight_histogram",
         )
-        os.makedirs(plot_dir, exist_ok=True)
 
-        fig, ax = plt.subplots(figsize=(10, 7))
-        bins = np.linspace(0.0, 1.000001, 41)
+        os.makedirs(
+            plot_dir,
+            exist_ok=True,
+        )
 
-        for gid in sorted(np.unique(groups)):
+        finite = weights[
+            np.isfinite(weights)
+        ]
+
+        if len(finite) == 0:
+            return
+
+        wmin = float(
+            finite.min()
+        )
+
+        wmax = float(
+            finite.max()
+        )
+
+        if np.isclose(
+            wmin,
+            wmax,
+        ):
+            eps = max(
+                abs(wmin) * 0.05,
+                1e-6,
+            )
+
+            bins = np.linspace(
+                wmin - eps,
+                wmax + eps,
+                30,
+            )
+        else:
+            bins = np.linspace(
+                wmin,
+                wmax,
+                41,
+            )
+
+        fig, ax = plt.subplots(
+            figsize=(10, 7)
+        )
+
+        for gid in sorted(
+            np.unique(groups)
+        ):
             mask = groups == gid
+
             if not np.any(mask):
                 continue
 
@@ -2299,129 +2766,70 @@ class Rater(Algorithm):
             )
 
         ax.set_xlabel(
-            "Effective EA-style training weight "
-            "(correct=1, wrong=trained-Rater rating)"
+            f"ALL-SAMPLE trained-Rater {self.weighting} weight"
         )
-        ax.set_ylabel("Density")
-        ax.set_xlim(0.0, 1.02)
+
+        ax.set_ylabel(
+            "Density"
+        )
+
         ax.set_title(
-            f"Final-classifier ACTUAL training weights by group | "
+            f"Final-classifier ALL-SAMPLE training weights by group | "
             f"epoch {epoch}\\n"
-            f"correct={100.0 * correct_mask.mean():.2f}% | "
-            f"misclassified={100.0 * wrong_mask.mean():.2f}%"
+            f"correct before update="
+            f"{100.0 * correctness.mean():.2f}%"
         )
-        ax.grid(True, linestyle=":", alpha=0.30)
-        ax.legend(loc="best", fontsize=9)
+
+        ax.grid(
+            True,
+            linestyle=":",
+            alpha=0.30,
+        )
+
+        ax.legend(
+            loc="best",
+            fontsize=9,
+        )
+
         fig.tight_layout()
 
-        effective_plot_path = os.path.join(
+        plot_path = os.path.join(
             plot_dir,
-            f"epoch_{epoch:03d}_{split_name}_effective_weight_hist.png",
+            f"epoch_{epoch:03d}_{split_name}_all_sample_weight_hist.png",
         )
+
         fig.savefig(
-            effective_plot_path,
+            plot_path,
             dpi=160,
             bbox_inches="tight",
         )
+
         plt.close(fig)
 
-        # Plot 2: misclassified samples only
-        wrong_plot_path = None
-
-        if np.any(wrong_mask):
-            wrong_plot_dir = os.path.join(
-                output_dir,
-                "plots",
-                "final_classifier_epoch_misclassified_rater_histogram",
-            )
-            os.makedirs(wrong_plot_dir, exist_ok=True)
-
-            wrong_weights = weights[wrong_mask]
-            wrong_groups = groups[wrong_mask]
-
-            fig, ax = plt.subplots(figsize=(10, 7))
-            bins = np.linspace(0.0, 1.000001, 41)
-
-            for gid in sorted(np.unique(wrong_groups)):
-                mask = wrong_groups == gid
-                if not np.any(mask):
-                    continue
-
-                ax.hist(
-                    wrong_weights[mask],
-                    bins=bins,
-                    density=True,
-                    alpha=0.45,
-                    label=(
-                        f"{self._group_display_name(gid)} "
-                        f"(wrong n={int(mask.sum())})"
-                    ),
-                )
-
-            ax.set_xlabel(
-                f"Trained-Rater {self.weighting} rating "
-                "(misclassified samples only)"
-            )
-            ax.set_ylabel("Density")
-            ax.set_xlim(0.0, 1.02)
-            ax.set_title(
-                f"Rater ratings of misclassified training samples by group "
-                f"| final-classifier epoch {epoch}"
-            )
-            ax.grid(True, linestyle=":", alpha=0.30)
-            ax.legend(loc="best", fontsize=9)
-            fig.tight_layout()
-
-            wrong_plot_path = os.path.join(
-                wrong_plot_dir,
-                f"epoch_{epoch:03d}_{split_name}_misclassified_rating_hist.png",
-            )
-            fig.savefig(
-                wrong_plot_path,
-                dpi=160,
-                bbox_inches="tight",
-            )
-            plt.close(fig)
-
-        # Group summaries
         summary_parts = []
 
-        for gid in sorted(np.unique(groups)):
-            group_mask = groups == gid
-            group_wrong = group_mask & wrong_mask
-
-            mean_weight = float(weights[group_mask].mean())
-            wrong_rate = float(
-                group_wrong.sum() / max(group_mask.sum(), 1)
-            )
-
-            if np.any(group_wrong):
-                mean_wrong_rating = float(
-                    weights[group_wrong].mean()
-                )
-            else:
-                mean_wrong_rating = float("nan")
+        for gid in sorted(
+            np.unique(groups)
+        ):
+            mask = groups == gid
 
             summary_parts.append(
-                f"g{int(gid)}: mean_w={mean_weight:.3f}, "
-                f"wrong={100.0 * wrong_rate:.1f}%, "
-                f"mean_wrong_rating={mean_wrong_rating:.3f}"
+                f"g{int(gid)}: "
+                f"mean_w={weights[mask].mean():.3f}, "
+                f"std_w={weights[mask].std():.3f}, "
+                f"acc_before_update="
+                f"{100.0 * correctness[mask].mean():.1f}%"
             )
 
         log(
-            f"[Final classifier epoch {epoch:03d} weights] "
+            f"[Final classifier epoch {epoch:03d} ALL-SAMPLE weights] "
             + "; ".join(summary_parts)
         )
-        log(
-            f"[Final classifier plot] saved actual-weight histogram: "
-            f"{effective_plot_path}"
-        )
 
-        if wrong_plot_path is not None:
-            log(
-                f"[Final classifier plot] saved misclassified-rating "
-                f"histogram: {wrong_plot_path}"
-            )
+        log(
+            f"[Final classifier plot] saved ALL-SAMPLE weight histogram: "
+            f"{plot_path}"
+        )
 
     # ========================================================
     # Final weighted classifier
@@ -2441,77 +2849,57 @@ class Rater(Algorithm):
         selection_dataset,
         test_dataset,
         output_dir,
-        calibration_split="val_subset1",
-        selection_split="val_subset2",
+        calibration_split="train_no_aug",
+        selection_split="val",
         test_split="test",
     ):
         """
-        Train a FRESH downstream linear classifier on the CALIBRATION set
-        with the already-trained Rater frozen as the weighting network.
+        Train a fresh linear classifier with the trained Rater frozen.
 
-        EA-style data roles:
-            calibration_dataset -> classifier optimization
-            selection_dataset   -> checkpoint/model selection
-            test_dataset        -> DIAGNOSTIC evaluation every epoch
+        EVERY calibration sample receives a Rater-derived weight:
 
-        IMPORTANT:
-            test metrics are NEVER used for checkpoint selection.
-            They are logged only so we can inspect generalization dynamics.
+            raw_i = frozen_Rater(z_i)
+            w_i   = selected transform(raw_i)
 
-        Per minibatch:
-            current classifier predicts
-                -> correct: weight = 1
-                -> wrong:   weight = trained-Rater rating
+            L = sum_i w_i * CE_i
 
-        The classifier is then updated with:
-
-            sum_i weight_i * CE_i
-
-        with NO division by sum(weights).
-
-        The Rater is never updated during this stage.
-
-        For every final-classifier epoch, this function saves:
-          * histogram of the ACTUAL effective training weights by group;
-          * histogram of Rater ratings for misclassified samples only;
-          * CSV of all actual weights/group/correctness values;
-          * validation effective-weight histogram.
-
-        By default, the best final classifier is selected by held-out selection WGA.
+        There is NO correct/misclassified gate and NO division by
+        sum(weights).
         """
-
         log(
             "[Rater] Training fresh final classifier with "
-            "FROZEN trained Rater..."
+            "FROZEN trained Rater and ALL-SAMPLE weighting..."
         )
+
         log(
-            f"[Final classifier] CALIBRATION/TRAIN split = "
-            f"{calibration_split} ({len(calibration_dataset)} samples)"
+            f"[Final classifier] calibration/train = "
+            f"{calibration_split} "
+            f"({len(calibration_dataset)} samples)"
         )
+
         log(
-            f"[Final classifier] SELECTION split = "
-            f"{selection_split} ({len(selection_dataset)} samples)"
+            f"[Final classifier] selection = "
+            f"{selection_split} "
+            f"({len(selection_dataset)} samples)"
         )
+
         log(
-            f"[Final classifier] TEST diagnostic split = "
-            f"{test_split} ({len(test_dataset)} samples)"
+            f"[Final classifier] test diagnostic = "
+            f"{test_split} "
+            f"({len(test_dataset)} samples)"
         )
-        log(
-            "[Final classifier] TEST is diagnostic only and is NOT used "
-            "for checkpoint selection."
-        )
+
         log(
             f"[Final classifier] selection metric = "
             f"{self.final_selection}"
         )
+
         log(
-            "[Final classifier] weighting rule: "
-            "correct -> 1.0; "
-            f"misclassified -> trained-Rater {self.weighting} rating."
+            "[Final classifier] EVERY sample uses a frozen-Rater weight."
         )
 
-        # Freeze the trained Rater completely.
         self.rater.eval()
+
         for p in self.rater.parameters():
             p.requires_grad_(False)
 
@@ -2536,9 +2924,13 @@ class Rater(Algorithm):
         best_state = None
         best_epoch = None
         best_metrics = None
+
         history = []
 
-        for epoch in range(1, self.final_epochs + 1):
+        for epoch in range(
+            1,
+            self.final_epochs + 1,
+        ):
             model.train()
 
             running_weighted_loss = 0.0
@@ -2546,44 +2938,53 @@ class Rater(Algorithm):
             total_examples = 0
             num_batches = 0
 
-            # Exact weights used during this epoch.
             epoch_weights = []
             epoch_groups = []
             epoch_correctness = []
 
             for z, y, g, _ in train_loader:
-                z = z.to(self.device, non_blocking=True)
-                y = y.to(self.device, non_blocking=True)
-                g = torch.as_tensor(g).to(
+                z = z.to(
                     self.device,
                     non_blocking=True,
                 )
 
-                # Current classifier predicts first.
+                y = y.to(
+                    self.device,
+                    non_blocking=True,
+                )
+
+                g = torch.as_tensor(
+                    g
+                ).to(
+                    self.device,
+                    non_blocking=True,
+                )
+
                 logits = model(z)
 
-                # EA-style gate with the frozen trained Rater.
                 with torch.no_grad():
-                    (
-                        weights,
-                        correct_mask,
-                        _,
-                    ) = self._ea_style_training_weights(
-                        z=z,
-                        y=y,
-                        logits=logits,
-                        raw_scores_all=None,
+                    raw_scores = self.rater(z)
+
+                    weights = self._scores_to_weights(
+                        raw_scores
                     )
 
-                # Store EXACT pre-update values used by this SGD step.
+                    correct_mask = (
+                        logits.argmax(dim=1).eq(y)
+                    )
+
                 epoch_weights.append(
                     weights.detach().cpu()
                 )
+
                 epoch_groups.append(
                     g.detach().cpu()
                 )
+
                 epoch_correctness.append(
-                    correct_mask.float().detach().cpu()
+                    correct_mask.float()
+                    .detach()
+                    .cpu()
                 )
 
                 per_sample_loss = F.cross_entropy(
@@ -2593,21 +2994,33 @@ class Rater(Algorithm):
                 )
 
                 weighted_loss = (
-                    per_sample_loss * weights
+                    per_sample_loss
+                    * weights
                 ).sum()
 
                 optimizer.zero_grad()
+
                 weighted_loss.backward()
+
                 optimizer.step()
 
-                running_weighted_loss += weighted_loss.item()
-                total_correct += correct_mask.sum().item()
-                total_examples += y.numel()
+                running_weighted_loss += float(
+                    weighted_loss.item()
+                )
+
+                total_correct += int(
+                    correct_mask.sum().item()
+                )
+
+                total_examples += int(
+                    y.numel()
+                )
+
                 num_batches += 1
 
-            train_acc = total_correct / max(
-                total_examples,
-                1,
+            train_acc = (
+                total_correct
+                / max(total_examples, 1)
             )
 
             train_weighted_loss = (
@@ -2643,25 +3056,24 @@ class Rater(Algorithm):
                     split_name=calibration_split,
                 )
 
-            # Held-out selection evaluation.
-            selection_metrics = self._evaluate_classifier(
-                model,
-                selection_dataset,
+            selection_metrics = (
+                self._evaluate_classifier(
+                    model,
+                    selection_dataset,
+                )
             )
 
-            selection_value = self._selection_value(
-                selection_metrics
+            selection_value = (
+                self._selection_value(
+                    selection_metrics
+                )
             )
 
-            # ------------------------------------------------
-            # TEST evaluation after EVERY epoch.
-            #
-            # This is DIAGNOSTIC ONLY. It must not influence
-            # checkpoint/model selection.
-            # ------------------------------------------------
-            test_metrics = self._evaluate_classifier(
-                model,
-                test_dataset,
+            test_metrics = (
+                self._evaluate_classifier(
+                    model,
+                    test_dataset,
+                )
             )
 
             history.append(
@@ -2677,67 +3089,43 @@ class Rater(Algorithm):
                     test_metrics["worst_group_accuracy"],
                     float(epoch_weights_np.mean()),
                     float(epoch_weights_np.std()),
-                    float(epoch_correctness_np.mean()),
                 ]
             )
 
             log(
                 f"[Final classifier epoch {epoch:03d}] "
-                f"weighted_calibration_loss={train_weighted_loss:.6f}, "
-                f"calibration_acc={100.0 * train_acc:.2f}%, "
-                f"mean_effective_weight={epoch_weights_np.mean():.4f}, "
-                f"selection_loss={selection_metrics['loss']:.6f}, "
-                f"selection_acc={100.0 * selection_metrics['accuracy']:.2f}%, "
+                f"weighted_train_loss={train_weighted_loss:.6f}, "
+                f"train_acc={100.0 * train_acc:.2f}%, "
+                f"mean_all_sample_weight={epoch_weights_np.mean():.4f}, "
+                f"selection_acc="
+                f"{100.0 * selection_metrics['accuracy']:.2f}%, "
                 f"selection_WGA="
                 f"{100.0 * selection_metrics['worst_group_accuracy']:.2f}%, "
-                f"test_loss={test_metrics['loss']:.6f}, "
                 f"test_acc={100.0 * test_metrics['accuracy']:.2f}%, "
                 f"test_WGA="
                 f"{100.0 * test_metrics['worst_group_accuracy']:.2f}%"
             )
 
-            test_group_str = ", ".join(
-                f"g{gid}={100.0 * acc:.2f}%"
-                for gid, acc in test_metrics["group_accuracy"].items()
-            )
-
-            log(
-                f"[Final classifier epoch {epoch:03d} TEST groups] "
-                f"{test_group_str}"
-            )
-
-            # Post-epoch selection-set weight histogram.
-            if should_plot_final:
-                selection_relationship = (
-                    self._classifier_score_loss_relationship(
-                        selection_dataset,
-                        model,
-                    )
-                )
-
-                self._save_group_score_histogram(
-                    relationship=selection_relationship,
-                    output_dir=output_dir,
-                    meta_step=epoch,
-                    split_name=f"{selection_split}_final_classifier_epoch",
-                    tag_prefix="final_classifier",
-                    score_kind="final",
-                )
-
-            # Save best downstream classifier according to selected metric.
             if selection_value > best_value:
                 best_value = selection_value
                 best_epoch = epoch
 
                 best_metrics = {
-                    "loss": float(selection_metrics["loss"]),
-                    "accuracy": float(selection_metrics["accuracy"]),
+                    "loss": float(
+                        selection_metrics["loss"]
+                    ),
+                    "accuracy": float(
+                        selection_metrics["accuracy"]
+                    ),
                     "worst_group_accuracy": float(
-                        selection_metrics["worst_group_accuracy"]
+                        selection_metrics[
+                            "worst_group_accuracy"
+                        ]
                     ),
                     "group_accuracy": {
                         int(k): float(v)
-                        for k, v in selection_metrics[
+                        for k, v
+                        in selection_metrics[
                             "group_accuracy"
                         ].items()
                     },
@@ -2745,7 +3133,8 @@ class Rater(Algorithm):
 
                 best_state = {
                     k: v.detach().cpu().clone()
-                    for k, v in model.state_dict().items()
+                    for k, v
+                    in model.state_dict().items()
                 }
 
                 torch.save(
@@ -2755,6 +3144,7 @@ class Rater(Algorithm):
                         "selection_metric": self.final_selection,
                         "selection_value": float(best_value),
                         "selection_metrics": best_metrics,
+                        "all_sample_rater_weighting": True,
                     },
                     os.path.join(
                         output_dir,
@@ -2762,32 +3152,20 @@ class Rater(Algorithm):
                     ),
                 )
 
-                log(
-                    f"[Final classifier] NEW BEST at epoch "
-                    f"{best_epoch:03d}: "
-                    f"selection_acc={100.0 * best_metrics['accuracy']:.2f}%, "
-                    f"selection_WGA="
-                    f"{100.0 * best_metrics['worst_group_accuracy']:.2f}% "
-                    f"(selected by {self.final_selection})"
-                )
-
         if best_state is None:
             raise RuntimeError(
                 "Final classifier training produced no model."
             )
 
-        # Restore selected best downstream classifier.
-        model.load_state_dict(best_state)
-        model.to(self.device)
-        model.eval()
-
-        log(
-            f"[Final classifier] Restored selected epoch "
-            f"{best_epoch:03d}. "
-            f"selection_acc={100.0 * best_metrics['accuracy']:.2f}%, "
-            f"selection_WGA="
-            f"{100.0 * best_metrics['worst_group_accuracy']:.2f}%."
+        model.load_state_dict(
+            best_state
         )
+
+        model.to(
+            self.device
+        )
+
+        model.eval()
 
         history_path = os.path.join(
             output_dir,
@@ -2800,25 +3178,32 @@ class Rater(Algorithm):
             newline="",
         ) as f:
             writer = csv.writer(f)
+
             writer.writerow(
                 [
                     "epoch",
-                    "weighted_calibration_loss",
-                    "calibration_accuracy",
+                    "weighted_train_loss",
+                    "train_accuracy",
                     "selection_loss",
                     "selection_accuracy",
                     "selection_wga",
                     "test_loss",
                     "test_accuracy",
                     "test_wga",
-                    "mean_effective_calibration_weight",
-                    "std_effective_train_weight",
-                    "fraction_correct_before_update",
+                    "mean_all_sample_weight",
+                    "std_all_sample_weight",
                 ]
             )
-            writer.writerows(history)
 
-        # Keep trained Rater frozen from here onward.
+            writer.writerows(
+                history
+            )
+
+        log(
+            f"[Final classifier] Restored selected epoch "
+            f"{best_epoch:03d}."
+        )
+
         self.rater.eval()
 
         return model
@@ -2827,193 +3212,507 @@ class Rater(Algorithm):
     # Main training -- FROZEN RATER / FINAL CLASSIFIER ONLY
     # ========================================================
 
-    def train(self, output_dir, split="train"):
+    def train(
+        self,
+        output_dir,
+        split="train",
+    ):
         """
-        FINAL-CLASSIFIER-ONLY mode.
+        FULL meta-training.
 
-        This function intentionally performs NO Rater meta-learning.
+        Total Rater objective:
 
-        Required workflow:
-          1. load an already-trained Rater through --check_point;
-          2. freeze it;
-          3. use val_subset1 as the calibration/training set;
-          4. use val_subset2 only for checkpoint/model selection;
-          5. evaluate test after every final-classifier epoch;
-          6. train only a fresh Linear(2048, 2) final classifier.
+            L_total
+                = L_outer
+                + lambda_g * L_grad
+                + optional regularizers
 
-        Rater weights keep the requested EA-style rule:
-
-            correct sample -> weight = 1
-            wrong sample   -> frozen-Rater rating
-
-        and:
-
-            L = SUM_i weight_i * CE_i
-
-        There is NO division by sum(weights).
+        with ALL-SAMPLE Rater weighting.
         """
-
         os.makedirs(
             output_dir,
             exist_ok=True,
         )
 
-        # ----------------------------------------------------
-        # A trained Rater checkpoint is mandatory.
-        # __init__ already calls _load_rater_checkpoint() when
-        # --check_point is provided.
-        # ----------------------------------------------------
-        checkpoint_path = str(
-            getattr(
-                self.config,
-                "check_point",
-                "",
+        if self.precompute_embeddings_only:
+            self._precompute_shared_embeddings(
+                output_dir
             )
-        ).strip()
+            return
 
-        if not checkpoint_path:
-            raise ValueError(
-                "Frozen-Rater final-classifier mode requires "
-                "--check_point /path/to/best_rater.pt"
-            )
-
-        if not os.path.exists(checkpoint_path):
-            raise ValueError(
-                f"Rater checkpoint does not exist: "
-                f"{checkpoint_path}"
-            )
-
-        # Make absolutely sure we are using the requested trained
-        # checkpoint and that it cannot change.
-        self._load_rater_checkpoint(
-            checkpoint_path
-        )
-
-        self.rater.to(
-            self.device
-        )
-        self.rater.eval()
-
-        for p in self.rater.parameters():
-            p.requires_grad_(False)
-
-        # No Rater optimization is allowed in this experiment.
-        self.inner_models = []
-
-        log("=" * 90)
-        log(
-            "[Frozen Rater] FINAL-CLASSIFIER-ONLY MODE"
-        )
-        log(
-            f"[Frozen Rater] loaded checkpoint: "
-            f"{checkpoint_path}"
-        )
-        log(
-            "[Frozen Rater] NO meta steps, NO inner models, "
-            "NO Rater optimizer updates."
-        )
-        log(
-            "[Frozen Rater] Only a fresh final "
-            "Linear(2048, 2) classifier will be trained."
-        )
-        log("=" * 90)
-
-        # ----------------------------------------------------
-        # Persistent embedding cache
-        # ----------------------------------------------------
         cache_dir = (
             self._resolve_embedding_cache_dir(
                 output_dir
             )
         )
 
-        log(
-            f"[Frozen Rater embeddings] shared cache: "
-            f"{cache_dir}"
+        (
+            inner_split,
+            outer_split,
+        ) = self._resolve_meta_splits(
+            split
         )
 
-        # ----------------------------------------------------
-        # EA-style validation split.
-        #
-        # This is the exact issue that caused the previous run
-        # to fail: split_val was 1.0, so val_subset1/2 did not
-        # exist.
-        # ----------------------------------------------------
-        if not self._has_ea_calibration_split():
-            raise ValueError(
-                "Frozen-Rater calibration requires "
-                "val_subset1 and val_subset2. "
-                "Run main.py with --split_val 0.4."
-            )
+        log(
+            f"[Rater] Inner/meta-train split: {inner_split}"
+        )
 
-        calibration_split = "val_subset1"
-        selection_split = "val_subset2"
-        test_split = "test"
+        log(
+            f"[Rater] Outer/held-out split: {outer_split}"
+        )
 
-        # ----------------------------------------------------
-        # Load stored embeddings. If val_subset1/2 have never
-        # been cached before, they are extracted ONCE and then
-        # persist in Drive for future runs.
-        # ----------------------------------------------------
-        calibration_dataset = (
+        log(
+            f"[Rater embeddings] Shared cache: {cache_dir}"
+        )
+
+        train_dataset = (
             self._extract_embedding_dataset(
-                calibration_split,
+                inner_split,
                 cache_dir,
             )
         )
 
-        selection_dataset = (
+        val_dataset = (
             self._extract_embedding_dataset(
-                selection_split,
+                outer_split,
                 cache_dir,
             )
         )
 
         test_dataset = (
             self._extract_embedding_dataset(
-                test_split,
+                "test",
                 cache_dir,
             )
         )
 
-        log(
-            "[Frozen Rater] EA-style final-classifier protocol:"
-        )
-        log(
-            f"[Frozen Rater] calibration/train = "
-            f"{calibration_split} "
-            f"({len(calibration_dataset)} samples)"
-        )
-        log(
-            f"[Frozen Rater] selection        = "
-            f"{selection_split} "
-            f"({len(selection_dataset)} samples)"
-        )
-        log(
-            f"[Frozen Rater] test             = "
-            f"{test_split} "
-            f"({len(test_dataset)} samples)"
-        )
-        log(
-            "[Frozen Rater] checkpoint selection uses "
-            "ONLY the selection split."
-        )
-        log(
-            "[Frozen Rater] test is evaluated every epoch "
-            "for diagnostics only."
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=self.config.batch_size,
+            shuffle=True,
+            num_workers=self.config.num_workers,
+            pin_memory=True,
         )
 
-        # ----------------------------------------------------
-        # Train a completely NEW final classifier.
-        #
-        # _train_final_classifier already:
-        #   * freezes the Rater,
-        #   * applies correct->1 / wrong->Rater,
-        #   * saves actual weight histograms each epoch,
-        #   * evaluates selection every epoch,
-        #   * evaluates TEST every epoch,
-        #   * selects best model by selection WGA by default.
-        # ----------------------------------------------------
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=self.config.batch_size,
+            shuffle=True,
+            num_workers=self.config.num_workers,
+            pin_memory=True,
+        )
+
+        train_iterator = iter(
+            train_loader
+        )
+
+        val_iterator = iter(
+            val_loader
+        )
+
+        self._initialize_inner_population()
+
+        refresh_period = max(
+            1,
+            self.refresh_steps,
+        )
+
+        refresh_offsets = [
+            (
+                i * refresh_period
+            )
+            // self.num_inner_models
+            for i in range(
+                self.num_inner_models
+            )
+        ]
+
+        best_meta_loss = float(
+            "inf"
+        )
+
+        best_path = os.path.join(
+            output_dir,
+            "best_rater.pt",
+        )
+
+        latest_path = os.path.join(
+            output_dir,
+            "latest_rater.pt",
+        )
+
+        history_path = os.path.join(
+            output_dir,
+            "rater_history.csv",
+        )
+
+        eval_history_path = os.path.join(
+            output_dir,
+            "rater_eval.csv",
+        )
+
+        history = []
+        eval_history = []
+
+        log(
+            "[Rater] Starting ALL-SAMPLE gradient-regularized "
+            "bilevel optimization"
+        )
+
+        log(
+            f"[Rater] meta_steps={self.meta_steps}, "
+            f"inner_steps={self.inner_steps}, "
+            f"inner_models={self.num_inner_models}, "
+            f"inner_lr={self.inner_lr}, "
+            f"outer_lr={self.outer_lr}, "
+            f"temperature={self.temperature}, "
+            f"lambda_g={self.grad_loss_weight}"
+        )
+
+        log(
+            "[Rater] ALL examples are rated during meta-training."
+        )
+
+        for meta_step in tqdm(
+            range(
+                1,
+                self.meta_steps + 1,
+            ),
+            desc="Rater meta-training",
+        ):
+            if meta_step > 1:
+                position = (
+                    meta_step - 1
+                ) % refresh_period
+
+                for i, offset in enumerate(
+                    refresh_offsets
+                ):
+                    if position == offset:
+                        self.inner_models[
+                            i
+                        ] = self._new_inner_model()
+
+            (
+                total_meta_loss,
+                outer_ce,
+                grad_mse,
+                train_iterator,
+                val_iterator,
+            ) = self._meta_step(
+                train_iterator,
+                val_iterator,
+                train_loader,
+                val_loader,
+            )
+
+            history.append(
+                [
+                    meta_step,
+                    total_meta_loss,
+                    outer_ce,
+                    grad_mse,
+                    self.grad_loss_weight,
+                ]
+            )
+
+            if total_meta_loss < best_meta_loss:
+                best_meta_loss = total_meta_loss
+
+                self._save_rater_checkpoint(
+                    best_path,
+                    meta_step,
+                    total_meta_loss,
+                    outer_ce=outer_ce,
+                    grad_mse=grad_mse,
+                )
+
+            should_eval = (
+                meta_step == 1
+                or meta_step % self.config.eval_freq == 0
+                or meta_step == self.meta_steps
+            )
+
+            should_plot = (
+                meta_step == 1
+                or meta_step % self.plot_freq == 0
+                or meta_step == self.meta_steps
+            )
+
+            if should_eval or should_plot:
+                population_metrics = (
+                    self._evaluate_inner_population(
+                        val_dataset,
+                        verbose=should_eval,
+                    )
+                )
+
+                relationship = (
+                    self._score_loss_relationship(
+                        val_dataset,
+                        models=self.inner_models,
+                    )
+                )
+
+                with torch.no_grad():
+                    sample_z = (
+                        val_dataset.embeddings[
+                            : min(
+                                1024,
+                                len(val_dataset),
+                            )
+                        ].to(
+                            self.device
+                        )
+                    )
+
+                    self.rater.eval()
+
+                    sample_scores = self.rater(
+                        sample_z
+                    )
+
+                    score_mean = float(
+                        sample_scores.mean().item()
+                    )
+
+                    score_std = float(
+                        sample_scores.std(
+                            unbiased=False
+                        ).item()
+                    )
+
+                log(
+                    f"[Rater step {meta_step:04d}] "
+                    f"total_meta_loss={total_meta_loss:.6f}, "
+                    f"outer_ce={outer_ce:.6f}, "
+                    f"grad_mse={grad_mse:.6f}, "
+                    f"lambda_g={self.grad_loss_weight:.4f}, "
+                    f"score_mean={score_mean:.6f}, "
+                    f"score_std={score_std:.6f}, "
+                    f"Spearman(score, loss)="
+                    f"{relationship['spearman_score_vs_loss']:.4f}"
+                )
+
+                if should_plot:
+                    self._save_all_score_diagnostics(
+                        relationship=relationship,
+                        output_dir=output_dir,
+                        meta_step=meta_step,
+                        split_name=outer_split,
+                        tag_prefix="meta_step",
+                    )
+
+                if should_eval:
+                    eval_history.append(
+                        [
+                            meta_step,
+                            total_meta_loss,
+                            outer_ce,
+                            grad_mse,
+                            self.grad_loss_weight,
+                            score_mean,
+                            score_std,
+                            population_metrics["mean_loss"],
+                            population_metrics["mean_accuracy"],
+                            population_metrics["mean_wga"],
+                            population_metrics["best_accuracy"],
+                            population_metrics["best_wga"],
+                            relationship["spearman_score_vs_loss"],
+                            relationship["pearson_score_vs_loss"],
+                            relationship[
+                                "spearman_score_vs_correctness"
+                            ],
+                            relationship[
+                                "spearman_final_score_vs_loss"
+                            ],
+                            relationship[
+                                "pearson_final_score_vs_loss"
+                            ],
+                            relationship[
+                                "spearman_final_score_vs_correctness"
+                            ],
+                        ]
+                    )
+
+            if (
+                getattr(
+                    self.config,
+                    "save_freq",
+                    0,
+                ) > 0
+                and meta_step % self.config.save_freq == 0
+            ):
+                self._save_population_snapshot(
+                    output_dir,
+                    meta_step,
+                )
+
+        # --------------------------------------------------------
+        # Save histories
+        # --------------------------------------------------------
+
+        last = history[-1]
+
+        self._save_rater_checkpoint(
+            latest_path,
+            self.meta_steps,
+            last[1],
+            outer_ce=last[2],
+            grad_mse=last[3],
+        )
+
+        with open(
+            history_path,
+            "w",
+            newline="",
+        ) as f:
+            writer = csv.writer(f)
+
+            writer.writerow(
+                [
+                    "meta_step",
+                    "total_meta_loss",
+                    "outer_ce",
+                    "grad_mse",
+                    "lambda_g",
+                ]
+            )
+
+            writer.writerows(
+                history
+            )
+
+        with open(
+            eval_history_path,
+            "w",
+            newline="",
+        ) as f:
+            writer = csv.writer(f)
+
+            writer.writerow(
+                [
+                    "meta_step",
+                    "total_meta_loss",
+                    "outer_ce",
+                    "grad_mse",
+                    "lambda_g",
+                    "score_mean",
+                    "score_std",
+                    "mean_inner_loss",
+                    "mean_inner_accuracy",
+                    "mean_inner_wga",
+                    "best_inner_accuracy",
+                    "best_inner_wga",
+                    "spearman_score_vs_loss",
+                    "pearson_score_vs_loss",
+                    "spearman_score_vs_correctness",
+                    "spearman_weight_vs_loss",
+                    "pearson_weight_vs_loss",
+                    "spearman_weight_vs_correctness",
+                ]
+            )
+
+            writer.writerows(
+                eval_history
+            )
+
+        # --------------------------------------------------------
+        # Restore best Rater
+        # --------------------------------------------------------
+
+        checkpoint = torch.load(
+            best_path,
+            map_location="cpu",
+            weights_only=False,
+        )
+
+        self.rater.load_state_dict(
+            checkpoint["rater_sd"]
+        )
+
+        self.rater.to(
+            self.device
+        )
+
+        self.rater.eval()
+
+        log(
+            f"[Rater] Meta-training complete. "
+            f"Best TOTAL meta loss={best_meta_loss:.6f}; "
+            f"restored step "
+            f"{checkpoint.get('meta_step', 'unknown')}."
+        )
+
+        # --------------------------------------------------------
+        # Save learned scores on train / meta-val / test
+        # --------------------------------------------------------
+
+        for split_name, dataset in [
+            (
+                inner_split,
+                train_dataset,
+            ),
+            (
+                outer_split,
+                val_dataset,
+            ),
+            (
+                "test",
+                test_dataset,
+            ),
+        ]:
+            score_payload = (
+                self._compute_scores(
+                    dataset,
+                    model=None,
+                )
+            )
+
+            torch.save(
+                score_payload,
+                os.path.join(
+                    output_dir,
+                    f"rater_scores_{split_name}.pt",
+                ),
+            )
+
+        # --------------------------------------------------------
+        # Final classifier: all-sample Rater weights
+        # --------------------------------------------------------
+
+        if (
+            self.use_calibration_final
+            and self._has_ea_calibration_split()
+        ):
+            (
+                calibration_split,
+                selection_split,
+            ) = (
+                self._resolve_final_classifier_splits()
+            )
+
+            calibration_dataset = (
+                self._extract_embedding_dataset(
+                    calibration_split,
+                    cache_dir,
+                )
+            )
+
+            selection_dataset = (
+                self._extract_embedding_dataset(
+                    selection_split,
+                    cache_dir,
+                )
+            )
+
+        else:
+            calibration_split = inner_split
+            selection_split = outer_split
+
+            calibration_dataset = train_dataset
+            selection_dataset = val_dataset
+
         self.final_classifier = (
             self._train_final_classifier(
                 calibration_dataset,
@@ -3022,13 +3721,10 @@ class Rater(Algorithm):
                 output_dir,
                 calibration_split=calibration_split,
                 selection_split=selection_split,
-                test_split=test_split,
+                test_split="test",
             )
         )
 
-        # ----------------------------------------------------
-        # Save restored-best final classifier
-        # ----------------------------------------------------
         final_model_path = os.path.join(
             output_dir,
             "final_weighted_classifier.pt",
@@ -3040,86 +3736,9 @@ class Rater(Algorithm):
         )
 
         log(
-            f"[Frozen Rater] saved BEST final classifier: "
+            f"[Rater] saved final ALL-SAMPLE weighted classifier: "
             f"{final_model_path}"
         )
-
-        # ----------------------------------------------------
-        # Save frozen-Rater + final-classifier weights/scores
-        # for calibration and selection sets.
-        # ----------------------------------------------------
-        final_calibration_scores = (
-            self._compute_scores(
-                calibration_dataset,
-                model=self.final_classifier,
-            )
-        )
-
-        torch.save(
-            final_calibration_scores,
-            os.path.join(
-                output_dir,
-                "rater_scores_val_subset1_final_classifier.pt",
-            ),
-        )
-
-        final_selection_scores = (
-            self._compute_scores(
-                selection_dataset,
-                model=self.final_classifier,
-            )
-        )
-
-        torch.save(
-            final_selection_scores,
-            os.path.join(
-                output_dir,
-                "rater_scores_val_subset2_final_classifier.pt",
-            ),
-        )
-
-        # ----------------------------------------------------
-        # Report BEST-restored classifier on all three sets.
-        # ----------------------------------------------------
-        for split_name, dataset in [
-            (
-                calibration_split,
-                calibration_dataset,
-            ),
-            (
-                selection_split,
-                selection_dataset,
-            ),
-            (
-                test_split,
-                test_dataset,
-            ),
-        ]:
-            metrics = (
-                self._evaluate_classifier(
-                    self.final_classifier,
-                    dataset,
-                )
-            )
-
-            group_str = ", ".join(
-                f"g{gid}="
-                f"{100.0 * acc:.2f}%"
-                for gid, acc
-                in metrics[
-                    "group_accuracy"
-                ].items()
-            )
-
-            log(
-                f"[BEST FINAL {split_name}] "
-                f"loss={metrics['loss']:.6f}, "
-                f"acc="
-                f"{100.0 * metrics['accuracy']:.2f}%, "
-                f"WGA="
-                f"{100.0 * metrics['worst_group_accuracy']:.2f}% "
-                f"({group_str})"
-            )
 
     # ========================================================
     # Test / final evaluation
