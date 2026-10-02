@@ -36,6 +36,16 @@ def wxe_fn(logits, y, weights):
 @register_algorithm("evidential_alignment")
 class EvidentialAlignment(Algorithm):
     def __init__(self, config):
+        # Evidential Alignment operates on frozen backbone embeddings /
+        # last-layer models during EDL + Alignment.  The current repository
+        # Algorithm._get_split() expects config.last_layer to exist, but the
+        # public argument parser does not define it.  Set it explicitly here
+        # before Algorithm initialization/evaluation.
+        #
+        # This is a compatibility fix only; it does not change the EA loss,
+        # weights, optimizer, data split, or training rule.
+        config.last_layer = True
+
         super(EvidentialAlignment, self).__init__(config)
         self._init_model()
         self._init_training()
@@ -88,6 +98,11 @@ class EvidentialAlignment(Algorithm):
             in {"1", "true", "yes", "y", "on"}
         )
         self.ea_diag_group_rows = []
+
+        log(
+            "[EA compatibility] config.last_layer=True; "
+            "validation/test evaluation will use embedding splits."
+        )
 
 
     # ============================================================
