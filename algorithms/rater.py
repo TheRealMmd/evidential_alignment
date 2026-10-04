@@ -585,22 +585,10 @@ class Rater(Algorithm):
                 "RATER_INNER_INIT_NOISE_STD must be >= 0."
             )
 
-        # This experiment intentionally keeps the previous ALL-SAMPLE
-        # weighting rule unchanged.
-        self.rate_all_samples = (
-            os.environ.get(
-                "RATER_RATE_ALL_SAMPLES",
-                "1",
-            ).strip().lower()
-            in {"1", "true", "yes", "y"}
-        )
-
-        if not self.rate_all_samples:
-            raise ValueError(
-                "This experiment keeps the ALL-SAMPLE Rater weighting "
-                "used by the attached implementation. Set "
-                "RATER_RATE_ALL_SAMPLES=1."
-            )
+        # This experiment uses the EA-style gate from the supplied Rater:
+        #   correct prediction -> weight 1
+        #   wrong prediction   -> Rater-derived rating
+        self.rate_all_samples = False
 
         self.rater_capacity = getattr(
             self.config, "rater_capacity", "medium"
@@ -744,12 +732,12 @@ class Rater(Algorithm):
         self.final_classifier = None
 
         log(
-            f"[Rater] ALL-SAMPLE Rater transform = "
+            f"[Rater] EA-style Rater transform = "
             f"{self.weighting}; temperature = {self.temperature}"
         )
         log(
-            "[Rater] ALL samples are rated and weighted by the Rater; "
-            "there is NO correct/misclassified gate."
+            "[Rater] EA-style gate: correct samples get weight=1; "
+            "only misclassified samples use the Rater rating."
         )
         log(
             "[Rater] Inner objective: L_inner = sum_i w_i * CE_i "
@@ -1316,16 +1304,61 @@ class Rater(Algorithm):
         raw_scores_all=None,
     ):
         """
-        Backward-compatible alias.
+        EA-style training weights from the supplied implementation:
 
-        In this experiment this NO LONGER performs EA-style
-        correct/wrong gating. It delegates to the ALL-SAMPLE rule.
+            correct prediction -> weight 1
+            wrong prediction   -> transformed Rater rating
+
+        The Rater is evaluated only on misclassified samples during
+        actual inner training. For diagnostics, raw_scores_all may be
+        supplied and then indexed on the misclassified subset.
         """
-        return self._all_sample_training_weights(
-            z=z,
-            y=y,
-            logits=logits,
-            raw_scores_all=raw_scores_all,
+        pred = logits.argmax(dim=1)
+        correct_mask = pred.eq(y)
+        misclassified_mask = ~correct_mask
+
+        weights = torch.ones(
+            y.shape[0],
+            device=logits.device,
+            dtype=logits.dtype,
+        )
+
+        if not bool(misclassified_mask.any()):
+            empty_scores = torch.empty(
+                0,
+                device=logits.device,
+                dtype=logits.dtype,
+            )
+            return weights, correct_mask, empty_scores
+
+        misclassified_indices = torch.nonzero(
+            misclassified_mask,
+            as_tuple=False,
+        ).squeeze(1)
+
+        if raw_scores_all is None:
+            misclassified_raw_scores = self.rater(
+                z[misclassified_mask]
+            )
+        else:
+            misclassified_raw_scores = raw_scores_all[
+                misclassified_mask
+            ]
+
+        misclassified_ratings = self._scores_to_weights(
+            misclassified_raw_scores
+        )
+
+        weights = weights.index_copy(
+            0,
+            misclassified_indices,
+            misclassified_ratings,
+        )
+
+        return (
+            weights,
+            correct_mask,
+            misclassified_raw_scores,
         )
 
     # ========================================================
@@ -1520,23 +1553,16 @@ class Rater(Algorithm):
         train_loader,
     ):
         """
-        Differentiable ALL-SAMPLE weighted classifier optimization.
+        Differentiable FULL-EPOCH EA-style weighted classifier optimization.
+
+        On each batch:
+            correct -> weight 1
+            wrong   -> Rater rating
 
         Inner objective:
+            L_inner = SUM_i weight_i * CE_i
 
-            L_inner
-                = sum_i w_i * CE(
-                    h_theta(z_i),
-                    y_i
-                  )
-
-        where:
-            w_i = transform(Rater(z_i))
-
-        There is intentionally NO division by sum(weights).
-
-        The Rater receives its learning signal ONLY through the held-out
-        outer classification cross-entropy in _meta_step().
+        There is NO division by sum(weights).
         """
         fast_weight = (
             inner_model.linear.weight
@@ -1554,27 +1580,15 @@ class Rater(Algorithm):
 
         last_raw_scores = None
 
-        for _ in range(
-            self.inner_steps
-        ):
-            batch, train_iterator = (
-                self._next_batch(
-                    train_iterator,
-                    train_loader,
-                )
+        for _ in range(self.inner_steps):
+            batch, train_iterator = self._next_batch(
+                train_iterator,
+                train_loader,
             )
 
             z, y, _, _ = batch
-
-            z = z.to(
-                self.device,
-                non_blocking=True,
-            )
-
-            y = y.to(
-                self.device,
-                non_blocking=True,
-            )
+            z = z.to(self.device, non_blocking=True)
+            y = y.to(self.device, non_blocking=True)
 
             logits = F.linear(
                 z,
@@ -1588,72 +1602,56 @@ class Rater(Algorithm):
                 reduction="none",
             )
 
-            raw_scores = self.rater(
-                z
-            )
-
-            weights = self._scores_to_weights(
-                raw_scores
+            weights, _, misclassified_raw_scores = (
+                self._ea_style_training_weights(
+                    z=z,
+                    y=y,
+                    logits=logits,
+                    raw_scores_all=None,
+                )
             )
 
             inner_loss = (
-                per_sample_loss
-                * weights
+                per_sample_loss * weights
             ).sum()
 
             if self.inner_reg_weight > 0:
-                inner_reg = (
-                    fast_weight.pow(2).sum()
-                    + fast_bias.pow(2).sum()
-                )
-
                 inner_loss = (
                     inner_loss
                     + self.inner_reg_weight
-                    * inner_reg
+                    * (
+                        fast_weight.pow(2).sum()
+                        + fast_bias.pow(2).sum()
+                    )
                 )
 
             grad_w, grad_b = torch.autograd.grad(
                 inner_loss,
-                [
-                    fast_weight,
-                    fast_bias,
-                ],
+                [fast_weight, fast_bias],
                 create_graph=True,
             )
 
             fast_weight = (
                 fast_weight
-                - self.inner_lr
-                * grad_w
+                - self.inner_lr * grad_w
             )
-
             fast_bias = (
                 fast_bias
-                - self.inner_lr
-                * grad_b
+                - self.inner_lr * grad_b
             )
 
-            last_raw_scores = (
-                raw_scores
-            )
-
-        fast_params = {
-            "weight": fast_weight,
-            "bias": fast_bias,
-        }
-
-        zero_aux = torch.zeros(
-            (),
-            device=self.device,
-        )
+            last_raw_scores = misclassified_raw_scores
 
         return (
-            fast_params,
+            {
+                "weight": fast_weight,
+                "bias": fast_bias,
+            },
             train_iterator,
             last_raw_scores,
-            zero_aux,
+            torch.zeros((), device=self.device),
         )
+
     # ========================================================
     # One bilevel/meta step
     # ========================================================
@@ -1666,53 +1664,32 @@ class Rater(Algorithm):
         val_loader,
     ):
         """
-        One classification-only Rater meta update.
+        One classification-only Rater update.
 
-        For every persistent inner classifier:
+        BOTH persistent inner models complete self.inner_steps batches
+        before the single optimizer.step() on the Rater. Since train() sets
+        self.inner_steps = len(train_loader), both models see the entire
+        training set once before every Rater update.
 
-            theta'
-                = differentiable weighted inner update
-
-            L_outer
-                = CE(
-                    h_theta'(z_outer),
-                    y_outer
-                  )
-
-        Across the inner-model population:
-
-            L_meta
-                = mean_m L_outer^(m)
-
-        This is the ENTIRE Rater objective in this first experiment.
-        There is no gradient-MSE auxiliary target and no Rater-side
-        regularization term.
+        For memory efficiency, each model's outer loss / num_models is
+        backpropagated immediately, accumulating Rater gradients. The Rater
+        optimizer step happens only after BOTH models are finished.
         """
         self.rater.train()
 
-        outer_batch, val_iterator = (
-            self._next_batch(
-                val_iterator,
-                val_loader,
-            )
+        outer_batch, val_iterator = self._next_batch(
+            val_iterator,
+            val_loader,
         )
 
-        z_outer, y_outer, _, _ = (
-            outer_batch
-        )
+        z_outer, y_outer, _, _ = outer_batch
+        z_outer = z_outer.to(self.device, non_blocking=True)
+        y_outer = y_outer.to(self.device, non_blocking=True)
 
-        z_outer = z_outer.to(
-            self.device,
-            non_blocking=True,
-        )
+        self.outer_optimizer.zero_grad()
 
-        y_outer = y_outer.to(
-            self.device,
-            non_blocking=True,
-        )
-
-        outer_losses = []
-        fast_parameter_sets = []
+        outer_values = []
+        committed_fast_params = []
 
         for inner_model in self.inner_models:
             (
@@ -1737,24 +1714,20 @@ class Rater(Algorithm):
                 y_outer,
             )
 
-            outer_losses.append(
-                outer_loss
+            (
+                outer_loss / self.num_inner_models
+            ).backward()
+
+            outer_values.append(
+                float(outer_loss.detach().item())
             )
 
-            fast_parameter_sets.append(
-                fast_params
+            committed_fast_params.append(
+                {
+                    "weight": fast_params["weight"].detach(),
+                    "bias": fast_params["bias"].detach(),
+                }
             )
-
-        outer_ce = torch.stack(
-            outer_losses
-        ).mean()
-
-        # CLASSIFICATION-ONLY META OBJECTIVE.
-        meta_loss = outer_ce
-
-        self.outer_optimizer.zero_grad()
-
-        meta_loss.backward()
 
         if self.grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(
@@ -1764,39 +1737,28 @@ class Rater(Algorithm):
 
         self.outer_optimizer.step()
 
-        # Persist the inner classifiers' updated states so the next
-        # meta-step continues their learning trajectory.
         with torch.no_grad():
-            for (
-                inner_model,
-                fast_params,
-            ) in zip(
+            for inner_model, fast_params in zip(
                 self.inner_models,
-                fast_parameter_sets,
+                committed_fast_params,
             ):
                 inner_model.linear.weight.copy_(
-                    fast_params[
-                        "weight"
-                    ].detach()
+                    fast_params["weight"]
+                )
+                inner_model.linear.bias.copy_(
+                    fast_params["bias"]
                 )
 
-                inner_model.linear.bias.copy_(
-                    fast_params[
-                        "bias"
-                    ].detach()
-                )
+        outer_ce = float(np.mean(outer_values))
 
         return (
-            float(
-                meta_loss.detach().item()
-            ),
-            float(
-                outer_ce.detach().item()
-            ),
+            outer_ce,
+            outer_ce,
             0.0,
             train_iterator,
             val_iterator,
         )
+
     # ========================================================
     # Evaluation helpers
     # ========================================================
@@ -2250,11 +2212,11 @@ class Rater(Algorithm):
             values = np.asarray(relationship["final_scores"])
             folder = f"final_score_histogram_{self.weighting}"
             xlabel = (
-                "Effective ALL-SAMPLE Rater weight "
+                "Effective EA-GATED Rater weight "
                 "(every sample=Rater weight)"
             )
             title_name = (
-                f"ALL-SAMPLE Rater weight distribution "
+                f"EA-GATED Rater weight distribution "
                 f"(wrong uses {self.weighting})"
             )
             filename_kind = "final_score_hist"
@@ -2340,7 +2302,7 @@ class Rater(Algorithm):
         """
         Save group-colored scatter of FINAL SCORE vs classifier loss.
 
-        FINAL SCORE means the effective ALL-SAMPLE Rater weight:
+        FINAL SCORE means the effective EA-GATED Rater weight:
         every sample -> Rater weight.
         """
 
@@ -2396,7 +2358,7 @@ class Rater(Algorithm):
             "Effective EA-style weight (every sample=Rater weight)"
         )
         ax.set_title(
-            f"ALL-SAMPLE Rater weight vs inner-model loss "
+            f"EA-GATED Rater weight vs inner-model loss "
             f"(wrong uses {self.weighting}) | "
             f"{split_name} | "
             f"step {meta_step}\n"
@@ -2569,7 +2531,7 @@ class Rater(Algorithm):
     def _compute_scores(self, dataset, model=None):
         """
         Save raw Rater scores and, when a classifier is supplied, the
-        effective ALL-SAMPLE Rater weights for that classifier.
+        effective EA-GATED Rater weights for that classifier.
         """
 
         loader = DataLoader(
@@ -2918,7 +2880,7 @@ class Rater(Algorithm):
         split_name="train",
     ):
         """
-        Save ACTUAL ALL-SAMPLE Rater weights used during one
+        Save ACTUAL EA-GATED Rater weights used during one
         final-classifier epoch.
 
         Correctness is diagnostic only; it does not gate the weights.
@@ -3056,7 +3018,7 @@ class Rater(Algorithm):
             )
 
         ax.set_xlabel(
-            f"ALL-SAMPLE trained-Rater {self.weighting} weight"
+            f"EA-GATED trained-Rater {self.weighting} weight"
         )
 
         ax.set_ylabel(
@@ -3064,7 +3026,7 @@ class Rater(Algorithm):
         )
 
         ax.set_title(
-            f"Final-classifier ALL-SAMPLE training weights by group | "
+            f"Final-classifier EA-GATED training weights by group | "
             f"epoch {epoch}\\n"
             f"correct before update="
             f"{100.0 * correctness.mean():.2f}%"
@@ -3112,12 +3074,12 @@ class Rater(Algorithm):
             )
 
         log(
-            f"[Final classifier epoch {epoch:03d} ALL-SAMPLE weights] "
+            f"[Final classifier epoch {epoch:03d} EA-GATED weights] "
             + "; ".join(summary_parts)
         )
 
         log(
-            f"[Final classifier plot] saved ALL-SAMPLE weight histogram: "
+            f"[Final classifier plot] saved EA-GATED weight histogram: "
             f"{plot_path}"
         )
 
@@ -3158,7 +3120,7 @@ class Rater(Algorithm):
         """
         log(
             "[Rater] Training fresh final classifier with "
-            "FROZEN trained Rater and ALL-SAMPLE weighting..."
+            "FROZEN trained Rater and EA-GATED weighting..."
         )
 
         log(
@@ -3825,8 +3787,9 @@ class Rater(Algorithm):
             "",
             f"Meta steps: {self.meta_steps}",
             f"Full inner steps per meta update: {self.inner_steps}",
-            f"Weighting: {self.weighting}",
+            f"Weighting transform for MISCLASSIFIED samples: {self.weighting}",
             f"Temperature: {self.temperature}",
+            "EA-style gate: correct -> 1; wrong -> Rater rating",
             f"Inner LR: {self.inner_lr}",
             f"Outer LR: {self.outer_lr}",
             f"Gradient clip: {self.grad_clip}",
@@ -4001,6 +3964,15 @@ class Rater(Algorithm):
                 cache_dir,
             )
 
+        # All needed embeddings are now in CPU tensors. Release the frozen
+        # ResNet-50 so the 38-step differentiable inner unroll has more GPU RAM.
+        if self.feature_model is not None:
+            self.feature_model.cpu()
+            del self.feature_model
+            self.feature_model = None
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
         train_loader = DataLoader(
             train_dataset,
             batch_size=self.config.batch_size,
@@ -4051,9 +4023,13 @@ class Rater(Algorithm):
         group_trajectory = []
 
         self._meta_log(
+            "[Rater] EA-style gate: correct -> 1; "
+            "misclassified -> Rater rating."
+        )
+        self._meta_log(
             f"[Rater] meta_steps={self.meta_steps}, "
             f"inner_models={self.num_inner_models}, "
-            f"weighting={self.weighting}, "
+            f"misclassified_weighting={self.weighting}, "
             f"inner_lr={self.inner_lr}, "
             f"outer_lr={self.outer_lr}, "
             f"temperature={self.temperature}, "
@@ -4198,6 +4174,8 @@ class Rater(Algorithm):
                 "rater_capacity": str(self.rater_capacity),
                 "weighting": str(self.weighting),
                 "temperature": float(self.temperature),
+                "ea_style_gate": "correct=1; wrong=RaterRating",
+                "rater_applied_only_to_misclassified": True,
                 "inner_models": 2,
                 "inner_initialization": "independent_random_linear",
                 "full_train_epoch_before_each_meta_update": True,
