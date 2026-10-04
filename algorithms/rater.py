@@ -1,5 +1,6 @@
 import os
 import csv
+import hashlib
 
 import matplotlib
 matplotlib.use("Agg")
@@ -114,7 +115,7 @@ class Rater(Algorithm):
     """
     Frozen trained feature-Rater used only for final-classifier training.
 
-    Image x -> frozen ImageNet ResNet-50 -> z -> r_eta(z) -> scalar score.
+    Image x -> frozen Waterbirds-ERM ResNet-50 -> z -> r_eta(z) -> scalar score.
 
     Inner update:
 
@@ -179,7 +180,7 @@ class Rater(Algorithm):
       * saves the ACTUAL final-classifier weight histograms every epoch;
       * selects the downstream classifier by validation WGA by default;
       * evaluates the final classifier on validation/test splits;
-      * uses a persistent shared embedding cache so frozen ResNet-50
+      * uses a persistent shared embedding cache so the frozen ERM ResNet-50
         embeddings are extracted once and reused across timestamped runs.
     """
 
@@ -203,27 +204,184 @@ class Rater(Algorithm):
 
         if not self.config.pretrained:
             raise ValueError(
-                "Rater is designed for an ImageNet-pretrained backbone. "
-                "Run with --pretrained True."
+                "This Rater experiment expects a ResNet-50 that was "
+                "initialized from ImageNet and then ERM-finetuned on "
+                "Waterbirds. Run with --pretrained True."
             )
 
         # ----------------------------------------------------
-        # Frozen ImageNet feature extractor
+        # Frozen Waterbirds-ERM feature extractor
         # ----------------------------------------------------
+        #
+        # IMPORTANT:
+        # We do NOT use a fresh ImageNet-only ResNet-50 here.
+        #
+        # We reconstruct the same Classifier architecture used by the
+        # repository, then load the saved Waterbirds ERM checkpoint:
+        #
+        #   image
+        #       -> ERM-finetuned ResNet-50 backbone
+        #       -> 2048-D embedding z
+        #       -> saved ERM linear classifier
+        #
+        # The backbone is frozen after loading. The saved ERM classifier
+        # parameters are also copied and used to initialize the persistent
+        # inner classifiers for Rater meta-learning.
+        # ----------------------------------------------------
+        self.erm_model_path = str(
+            getattr(
+                self.config,
+                "erm_model",
+                "",
+            )
+            or os.environ.get(
+                "RATER_ERM_MODEL",
+                "",
+            )
+        ).strip()
+
+        if not self.erm_model_path:
+            raise ValueError(
+                "This Rater experiment requires the saved Waterbirds ERM "
+                "checkpoint. Pass it with --erm_model PATH or set "
+                "RATER_ERM_MODEL."
+            )
+
+        if not os.path.exists(self.erm_model_path):
+            raise FileNotFoundError(
+                f"ERM checkpoint does not exist: {self.erm_model_path}"
+            )
+
         self.feature_model = Classifier(
             backbone=self.config.backbone,
             num_classes=self.n_classes,
             pretrained=True,
         ).to(self.device)
 
+        erm_checkpoint = torch.load(
+            self.erm_model_path,
+            map_location="cpu",
+            weights_only=False,
+        )
+
+        if (
+            isinstance(erm_checkpoint, dict)
+            and "model_sd" in erm_checkpoint
+        ):
+            erm_state_dict = erm_checkpoint["model_sd"]
+        else:
+            erm_state_dict = erm_checkpoint
+
+        filtered_erm_state_dict = {
+            k: v
+            for k, v in erm_state_dict.items()
+            if not k.endswith("position_ids")
+        }
+
+        incompatible = self.feature_model.load_state_dict(
+            filtered_erm_state_dict,
+            strict=False,
+        )
+
+        self.erm_checkpoint_epoch = (
+            erm_checkpoint.get("epoch", None)
+            if isinstance(erm_checkpoint, dict)
+            else None
+        )
+
+        self.erm_checkpoint_sel_metric = (
+            erm_checkpoint.get("sel_metric", None)
+            if isinstance(erm_checkpoint, dict)
+            else None
+        )
+
+        if not isinstance(
+            self.feature_model.fc,
+            nn.Linear,
+        ):
+            raise TypeError(
+                "Expected the saved ERM Classifier to have a linear .fc "
+                "head, but got "
+                f"{type(self.feature_model.fc).__name__}."
+            )
+
+        self.feature_dim = (
+            self.feature_model.backbone.num_features
+        )
+
+        if (
+            self.feature_model.fc.weight.shape[1]
+            != self.feature_dim
+        ):
+            raise ValueError(
+                "ERM classifier input dimension does not match the "
+                "backbone embedding dimension."
+            )
+
+        # Exact ERM classifier parameters used as the base initialization
+        # for the persistent inner classifiers.
+        self.erm_head_weight = (
+            self.feature_model.fc.weight
+            .detach()
+            .clone()
+        )
+
+        self.erm_head_bias = (
+            self.feature_model.fc.bias
+            .detach()
+            .clone()
+        )
+
+        # Fingerprint the exact checkpoint file so this cache can never be
+        # confused with the old ImageNet-only embedding cache.
+        erm_stat = os.stat(
+            self.erm_model_path
+        )
+
+        fingerprint_text = (
+            f"{os.path.abspath(self.erm_model_path)}|"
+            f"{erm_stat.st_size}|"
+            f"{erm_stat.st_mtime_ns}"
+        )
+
+        self.erm_checkpoint_fingerprint = (
+            hashlib.sha1(
+                fingerprint_text.encode("utf-8")
+            ).hexdigest()[:12]
+        )
+
         self.feature_model.eval()
+
         for p in self.feature_model.parameters():
             p.requires_grad_(False)
 
-        self.feature_dim = self.feature_model.backbone.num_features
+        log(
+            f"[Rater] Loaded frozen Waterbirds ERM model from: "
+            f"{self.erm_model_path}"
+        )
 
         log(
-            f"[Rater] Frozen {self.config.backbone} feature extractor. "
+            f"[Rater] ERM checkpoint epoch="
+            f"{self.erm_checkpoint_epoch}, "
+            f"sel_metric={self.erm_checkpoint_sel_metric}, "
+            f"fingerprint={self.erm_checkpoint_fingerprint}"
+        )
+
+        if incompatible.missing_keys:
+            log(
+                f"[Rater] ERM load missing keys: "
+                f"{incompatible.missing_keys}"
+            )
+
+        if incompatible.unexpected_keys:
+            log(
+                f"[Rater] ERM load unexpected keys: "
+                f"{incompatible.unexpected_keys}"
+            )
+
+        log(
+            f"[Rater] Frozen ERM-finetuned "
+            f"{self.config.backbone} backbone. "
             f"Embedding dimension = {self.feature_dim}"
         )
 
@@ -273,7 +431,16 @@ class Rater(Algorithm):
             getattr(self.config, "rater_inner_steps", 2)
         )
         self.num_inner_models = int(
-            getattr(self.config, "rater_num_inner_models", 4)
+            os.environ.get(
+                "RATER_NUM_INNER_MODELS",
+                str(
+                    getattr(
+                        self.config,
+                        "rater_num_inner_models",
+                        2,
+                    )
+                ),
+            )
         )
         self.inner_lr = float(
             getattr(self.config, "rater_inner_lr", 1e-2)
@@ -282,7 +449,16 @@ class Rater(Algorithm):
             getattr(self.config, "rater_outer_lr", 3e-4)
         )
         self.temperature = float(
-            getattr(self.config, "rater_temperature", 2.0)
+            os.environ.get(
+                "RATER_TEMPERATURE",
+                str(
+                    getattr(
+                        self.config,
+                        "rater_temperature",
+                        2.0,
+                    )
+                ),
+            )
         )
 
         # ----------------------------------------------------
@@ -302,7 +478,16 @@ class Rater(Algorithm):
         # There is NO division by sum(weights).
         # ----------------------------------------------------
         self.weighting = str(
-            getattr(self.config, "rater_weighting", "softmax")
+            os.environ.get(
+                "RATER_WEIGHTING",
+                str(
+                    getattr(
+                        self.config,
+                        "rater_weighting",
+                        "softmax",
+                    )
+                ),
+            )
         ).lower()
 
         self.refresh_steps = int(
@@ -314,56 +499,58 @@ class Rater(Algorithm):
         self.inner_reg_weight = float(
             getattr(self.config, "rater_inner_reg_weight", 0.0)
         )
-        self.outer_reg_weight = float(
-            getattr(self.config, "rater_outer_reg_weight", 0.0)
-        )
-        self.score_reg_weight = float(
-            getattr(self.config, "rater_score_reg_weight", 0.0)
-        )
+        self.outer_reg_weight = 0.0
+        self.score_reg_weight = 0.0
 
         # ----------------------------------------------------
-        # NEW: gradient-magnitude auxiliary Rater loss.
-        #
-        # For every training sample i and current inner classifier:
-        #
-        #   G_i = || d CE_i / d(W,b) ||_2
-        #
-        # G_i is converted to a percentile WITHIN ITS OWN CLASS:
-        #
-        #   q_i = Percentile(G_i | y_i)
-        #
-        # The Rater's bounded auxiliary prediction is:
-        #
-        #   r_i = sigmoid(raw_rater_score_i)
-        #
-        # and:
-        #
-        #   L_grad = mean_i (r_i - q_i)^2
-        #
-        # Total meta objective:
-        #
-        #   L_total = L_outer + lambda_g * L_grad + regularizers
-        #
-        # lambda_g is controlled from Colab through:
-        #
-        #   RATER_GRAD_LOSS_WEIGHT
-        #
-        # so config.py does NOT need a new CLI argument.
+        # First ERM-initialized Rater experiment
         # ----------------------------------------------------
-        self.grad_loss_weight = float(
+        #
+        # Rater meta-objective:
+        #
+        #       L_meta = CE(
+        #           h_theta'(z_outer),
+        #           y_outer
+        #       )
+        #
+        # There is NO gradient-magnitude auxiliary loss and no additional
+        # Rater regularizer in the meta objective for this experiment.
+        #
+        # The inner classifiers start from the SAVED ERM classifier:
+        #
+        #   inner model 0:
+        #       exact ERM classifier weights
+        #
+        #   inner models 1,2,...:
+        #       ERM classifier + very small Gaussian perturbation
+        #
+        # This keeps the two-model population near the same useful ERM
+        # solution without making their meta-trajectories exactly identical.
+        # With RATER_NUM_INNER_MODELS=1, the sole inner model is the exact
+        # saved ERM classifier.
+        # ----------------------------------------------------
+        self.grad_loss_weight = 0.0
+
+        self.inner_init_noise_std = float(
             os.environ.get(
-                "RATER_GRAD_LOSS_WEIGHT",
+                "RATER_INNER_INIT_NOISE_STD",
                 str(
                     getattr(
                         self.config,
-                        "rater_grad_loss_weight",
-                        1.0,
+                        "rater_inner_init_noise_std",
+                        1e-3,
                     )
                 ),
             )
         )
 
-        # This experiment intentionally rates ALL examples.
+        if self.inner_init_noise_std < 0:
+            raise ValueError(
+                "RATER_INNER_INIT_NOISE_STD must be >= 0."
+            )
+
+        # This experiment intentionally keeps the previous ALL-SAMPLE
+        # weighting rule unchanged.
         self.rate_all_samples = (
             os.environ.get(
                 "RATER_RATE_ALL_SAMPLES",
@@ -374,13 +561,9 @@ class Rater(Algorithm):
 
         if not self.rate_all_samples:
             raise ValueError(
-                "This gradient-percentile Rater experiment requires "
+                "This experiment keeps the ALL-SAMPLE Rater weighting "
+                "used by the attached implementation. Set "
                 "RATER_RATE_ALL_SAMPLES=1."
-            )
-
-        if self.grad_loss_weight < 0:
-            raise ValueError(
-                "RATER_GRAD_LOSS_WEIGHT / lambda_g must be >= 0."
             )
 
         self.rater_capacity = getattr(
@@ -515,13 +698,14 @@ class Rater(Algorithm):
             "WITHOUT dividing by sum(w)."
         )
         log(
-            f"[Rater] Gradient auxiliary loss: "
-            f"L_total = L_outer + lambda_g * L_grad, "
-            f"lambda_g={self.grad_loss_weight:.6f}"
+            "[Rater] Meta objective = OUTER CLASSIFICATION "
+            "CROSS-ENTROPY ONLY."
         )
         log(
-            "[Rater] L_grad target = within-class percentile of exact "
-            "per-sample classifier parameter-gradient magnitude."
+            f"[Rater] Inner population = {self.num_inner_models}; "
+            f"model 0 starts from the EXACT ERM classifier; "
+            f"models 1+ use ERM + Gaussian noise "
+            f"(std={self.inner_init_noise_std:g})."
         )
 
         if self.config.check_point:
@@ -543,27 +727,38 @@ class Rater(Algorithm):
 
     def _embedding_cache_namespace(self):
         """
-        Namespace shared embeddings by representation.
+        Namespace shared embeddings by the EXACT frozen ERM representation.
+
+        This intentionally differs from the old ImageNet-only cache.
         """
         dataset_name = self._safe_cache_token(
-            getattr(self.config, "dataset", "dataset")
+            getattr(
+                self.config,
+                "dataset",
+                "dataset",
+            )
         )
+
         backbone_name = self._safe_cache_token(
             self.config.backbone
         )
+
         resolution = self._safe_cache_token(
-            getattr(self.config, "resolution", 224)
+            getattr(
+                self.config,
+                "resolution",
+                224,
+            )
         )
 
-        pretrained_tag = (
-            "imagenet_pretrained"
-            if bool(self.config.pretrained)
-            else "not_pretrained"
+        representation_tag = (
+            f"{backbone_name}_waterbirds_erm_"
+            f"{self.erm_checkpoint_fingerprint}"
         )
 
         return os.path.join(
             dataset_name,
-            f"{backbone_name}_{pretrained_tag}",
+            representation_tag,
             f"resolution_{resolution}",
         )
 
@@ -608,6 +803,18 @@ class Rater(Algorithm):
             ),
             "feature_dim": int(self.feature_dim),
             "n_classes": int(self.n_classes),
+            "representation_source": (
+                "waterbirds_erm_checkpoint"
+            ),
+            "erm_checkpoint_path": os.path.abspath(
+                self.erm_model_path
+            ),
+            "erm_checkpoint_fingerprint": (
+                self.erm_checkpoint_fingerprint
+            ),
+            "erm_checkpoint_epoch": (
+                self.erm_checkpoint_epoch
+            ),
         }
 
         if "subset" in str(split):
@@ -906,11 +1113,66 @@ class Rater(Algorithm):
     # ========================================================
     # Inner models
     # ========================================================
-    # ========================================================
-    # Inner models
-    # ========================================================
 
-    def _new_inner_model(self):
+    def _new_inner_model(
+        self,
+        model_index=0,
+    ):
+        """
+        Construct one persistent inner classifier.
+
+        model_index == 0:
+            exact saved ERM classifier.
+
+        model_index > 0:
+            saved ERM classifier + tiny Gaussian perturbation.
+
+        The perturbation is only to avoid an exactly duplicated
+        two-model population. The models still start in the local
+        neighborhood of the SAME learned ERM classifier.
+        """
+        model = InnerLinearClassifier(
+            input_dim=self.feature_dim,
+            num_classes=self.n_classes,
+        ).to(self.device)
+
+        with torch.no_grad():
+            model.linear.weight.copy_(
+                self.erm_head_weight
+            )
+
+            model.linear.bias.copy_(
+                self.erm_head_bias
+            )
+
+            if (
+                model_index > 0
+                and self.inner_init_noise_std > 0
+            ):
+                model.linear.weight.add_(
+                    torch.randn_like(
+                        model.linear.weight
+                    )
+                    * self.inner_init_noise_std
+                )
+
+                model.linear.bias.add_(
+                    torch.randn_like(
+                        model.linear.bias
+                    )
+                    * self.inner_init_noise_std
+                )
+
+        return model
+
+    def _new_final_classifier(self):
+        """
+        Preserve the previous downstream experiment:
+        the FINAL classifier remains a fresh random linear classifier.
+
+        Only the meta-learning inner population is ERM-initialized in this
+        first experiment.
+        """
         return InnerLinearClassifier(
             input_dim=self.feature_dim,
             num_classes=self.n_classes,
@@ -918,9 +1180,33 @@ class Rater(Algorithm):
 
     def _initialize_inner_population(self):
         self.inner_models = [
-            self._new_inner_model()
-            for _ in range(self.num_inner_models)
+            self._new_inner_model(
+                model_index=i
+            )
+            for i in range(
+                self.num_inner_models
+            )
         ]
+
+        with torch.no_grad():
+            for i, model in enumerate(
+                self.inner_models
+            ):
+                weight_delta = (
+                    model.linear.weight
+                    - self.erm_head_weight
+                )
+
+                bias_delta = (
+                    model.linear.bias
+                    - self.erm_head_bias
+                )
+
+                log(
+                    f"[Rater inner init {i}] "
+                    f"||dW||={weight_delta.norm().item():.8f}, "
+                    f"||db||={bias_delta.norm().item():.8f}"
+                )
 
     @staticmethod
     def _next_batch(iterator, loader):
@@ -1213,19 +1499,23 @@ class Rater(Algorithm):
         train_loader,
     ):
         """
-        Differentiable ALL-SAMPLE weighted inner optimization.
+        Differentiable ALL-SAMPLE weighted classifier optimization.
 
-        Inner classifier:
-            L_inner = sum_i w_i * CE_i
+        Inner objective:
 
-        Rater auxiliary target:
-            L_grad = MSE(
-                sigmoid(Rater(z_i)),
-                within_class_percentile(||grad_i||)
-            )
+            L_inner
+                = sum_i w_i * CE(
+                    h_theta(z_i),
+                    y_i
+                  )
 
-        L_grad is returned to the meta step; it is NOT part of the
-        inner-classifier objective.
+        where:
+            w_i = transform(Rater(z_i))
+
+        There is intentionally NO division by sum(weights).
+
+        The Rater receives its learning signal ONLY through the held-out
+        outer classification cross-entropy in _meta_step().
         """
         fast_weight = (
             inner_model.linear.weight
@@ -1242,7 +1532,6 @@ class Rater(Algorithm):
         )
 
         last_raw_scores = None
-        grad_aux_losses = []
 
         for _ in range(
             self.inner_steps
@@ -1278,7 +1567,6 @@ class Rater(Algorithm):
                 reduction="none",
             )
 
-            # ALL samples receive a Rater score.
             raw_scores = self.rater(
                 z
             )
@@ -1287,23 +1575,6 @@ class Rater(Algorithm):
                 raw_scores
             )
 
-            (
-                grad_mse,
-                _,
-                _,
-                _,
-            ) = self._gradient_percentile_mse(
-                raw_scores=raw_scores,
-                z=z,
-                y=y,
-                logits=logits,
-            )
-
-            grad_aux_losses.append(
-                grad_mse
-            )
-
-            # No division by weights.sum().
             inner_loss = (
                 per_sample_loss
                 * weights
@@ -1342,24 +1613,26 @@ class Rater(Algorithm):
                 * grad_b
             )
 
-            last_raw_scores = raw_scores
+            last_raw_scores = (
+                raw_scores
+            )
 
         fast_params = {
             "weight": fast_weight,
             "bias": fast_bias,
         }
 
-        mean_grad_mse = torch.stack(
-            grad_aux_losses
-        ).mean()
+        zero_aux = torch.zeros(
+            (),
+            device=self.device,
+        )
 
         return (
             fast_params,
             train_iterator,
             last_raw_scores,
-            mean_grad_mse,
+            zero_aux,
         )
-
     # ========================================================
     # One bilevel/meta step
     # ========================================================
@@ -1372,14 +1645,27 @@ class Rater(Algorithm):
         val_loader,
     ):
         """
-        One Rater meta update.
+        One classification-only Rater meta update.
 
-            L_total
-                = L_outer
-                + lambda_g * L_grad
-                + optional regularizers
+        For every persistent inner classifier:
 
-        L_grad is averaged across all inner steps and inner models.
+            theta'
+                = differentiable weighted inner update
+
+            L_outer
+                = CE(
+                    h_theta'(z_outer),
+                    y_outer
+                  )
+
+        Across the inner-model population:
+
+            L_meta
+                = mean_m L_outer^(m)
+
+        This is the ENTIRE Rater objective in this first experiment.
+        There is no gradient-MSE auxiliary target and no Rater-side
+        regularization term.
         """
         self.rater.train()
 
@@ -1390,7 +1676,9 @@ class Rater(Algorithm):
             )
         )
 
-        z_outer, y_outer, _, _ = outer_batch
+        z_outer, y_outer, _, _ = (
+            outer_batch
+        )
 
         z_outer = z_outer.to(
             self.device,
@@ -1403,7 +1691,6 @@ class Rater(Algorithm):
         )
 
         outer_losses = []
-        grad_mse_losses = []
         fast_parameter_sets = []
 
         for inner_model in self.inner_models:
@@ -1411,7 +1698,7 @@ class Rater(Algorithm):
                 fast_params,
                 train_iterator,
                 _,
-                grad_mse,
+                _,
             ) = self._inner_unroll(
                 inner_model,
                 train_iterator,
@@ -1433,10 +1720,6 @@ class Rater(Algorithm):
                 outer_loss
             )
 
-            grad_mse_losses.append(
-                grad_mse
-            )
-
             fast_parameter_sets.append(
                 fast_params
             )
@@ -1445,42 +1728,8 @@ class Rater(Algorithm):
             outer_losses
         ).mean()
 
-        grad_mse = torch.stack(
-            grad_mse_losses
-        ).mean()
-
-        meta_loss = (
-            outer_ce
-            + self.grad_loss_weight
-            * grad_mse
-        )
-
-        if self.outer_reg_weight > 0:
-            outer_reg = sum(
-                p.pow(2).sum()
-                for p in self.rater.parameters()
-            )
-
-            meta_loss = (
-                meta_loss
-                + self.outer_reg_weight
-                * outer_reg
-            )
-
-        if self.score_reg_weight > 0:
-            outer_scores = self.rater(
-                z_outer
-            )
-
-            score_reg = -torch.var(
-                outer_scores
-            )
-
-            meta_loss = (
-                meta_loss
-                + self.score_reg_weight
-                * score_reg
-            )
+        # CLASSIFICATION-ONLY META OBJECTIVE.
+        meta_loss = outer_ce
 
         self.outer_optimizer.zero_grad()
 
@@ -1494,6 +1743,8 @@ class Rater(Algorithm):
 
         self.outer_optimizer.step()
 
+        # Persist the inner classifiers' updated states so the next
+        # meta-step continues their learning trajectory.
         with torch.no_grad():
             for (
                 inner_model,
@@ -1503,21 +1754,28 @@ class Rater(Algorithm):
                 fast_parameter_sets,
             ):
                 inner_model.linear.weight.copy_(
-                    fast_params["weight"].detach()
+                    fast_params[
+                        "weight"
+                    ].detach()
                 )
 
                 inner_model.linear.bias.copy_(
-                    fast_params["bias"].detach()
+                    fast_params[
+                        "bias"
+                    ].detach()
                 )
 
         return (
-            float(meta_loss.detach().item()),
-            float(outer_ce.detach().item()),
-            float(grad_mse.detach().item()),
+            float(
+                meta_loss.detach().item()
+            ),
+            float(
+                outer_ce.detach().item()
+            ),
+            0.0,
             train_iterator,
             val_iterator,
         )
-
     # ========================================================
     # Evaluation helpers
     # ========================================================
@@ -2425,16 +2683,27 @@ class Rater(Algorithm):
                 "outer_loss": meta_loss,
 
                 "outer_ce": outer_ce,
-                "grad_mse": grad_mse,
-                "lambda_g": self.grad_loss_weight,
-
-                "gradient_target": (
-                    "within_class_percentile_of_param_grad_norm"
-                ),
-                "gradient_prediction": (
-                    "sigmoid_raw_rater_score"
+                "grad_mse": 0.0,
+                "lambda_g": 0.0,
+                "meta_objective": (
+                    "outer_classification_cross_entropy_only"
                 ),
                 "rate_all_samples": True,
+                "inner_initialization": (
+                    "erm_head_exact_for_model0_"
+                    "plus_small_noise_for_models1plus"
+                ),
+                "num_inner_models": self.num_inner_models,
+                "inner_init_noise_std": (
+                    self.inner_init_noise_std
+                ),
+                "erm_model_path": self.erm_model_path,
+                "erm_checkpoint_fingerprint": (
+                    self.erm_checkpoint_fingerprint
+                ),
+                "erm_checkpoint_epoch": (
+                    self.erm_checkpoint_epoch
+                ),
 
                 "feature_dim": self.feature_dim,
                 "backbone": self.config.backbone,
@@ -2512,7 +2781,7 @@ class Rater(Algorithm):
             map_location="cpu",
             weights_only=False,
         )
-        model = self._new_inner_model()
+        model = self._new_final_classifier()
         if "model_sd" in checkpoint:
             model.load_state_dict(checkpoint["model_sd"])
         else:
@@ -2903,7 +3172,7 @@ class Rater(Algorithm):
         for p in self.rater.parameters():
             p.requires_grad_(False)
 
-        model = self._new_inner_model()
+        model = self._new_final_classifier()
 
         optimizer = torch.optim.SGD(
             model.parameters(),
@@ -3218,16 +3487,14 @@ class Rater(Algorithm):
         split="train",
     ):
         """
-        FULL meta-training.
+        FULL meta-training with ALL-SAMPLE Rater weighting.
 
-        Total Rater objective:
+        Rater meta objective:
 
-            L_total
-                = L_outer
-                + lambda_g * L_grad
-                + optional regularizers
+            L_meta = mean outer classification CE
 
-        with ALL-SAMPLE Rater weighting.
+        The inner classifiers begin from the saved Waterbirds ERM
+        classifier (exact model 0; tiny perturbation for models 1+).
         """
         os.makedirs(
             output_dir,
@@ -3355,8 +3622,8 @@ class Rater(Algorithm):
         eval_history = []
 
         log(
-            "[Rater] Starting ALL-SAMPLE gradient-regularized "
-            "bilevel optimization"
+            "[Rater] Starting ALL-SAMPLE classification-only "
+            "bilevel optimization from the saved ERM classifier"
         )
 
         log(
@@ -3366,7 +3633,7 @@ class Rater(Algorithm):
             f"inner_lr={self.inner_lr}, "
             f"outer_lr={self.outer_lr}, "
             f"temperature={self.temperature}, "
-            f"lambda_g={self.grad_loss_weight}"
+            f"inner_init_noise_std={self.inner_init_noise_std}"
         )
 
         log(
@@ -3391,7 +3658,9 @@ class Rater(Algorithm):
                     if position == offset:
                         self.inner_models[
                             i
-                        ] = self._new_inner_model()
+                        ] = self._new_inner_model(
+                            model_index=i
+                        )
 
             (
                 total_meta_loss,
@@ -3486,8 +3755,7 @@ class Rater(Algorithm):
                     f"[Rater step {meta_step:04d}] "
                     f"total_meta_loss={total_meta_loss:.6f}, "
                     f"outer_ce={outer_ce:.6f}, "
-                    f"grad_mse={grad_mse:.6f}, "
-                    f"lambda_g={self.grad_loss_weight:.4f}, "
+                    f"meta_objective=classification_ce_only, "
                     f"score_mean={score_mean:.6f}, "
                     f"score_std={score_std:.6f}, "
                     f"Spearman(score, loss)="
@@ -3574,8 +3842,8 @@ class Rater(Algorithm):
                     "meta_step",
                     "total_meta_loss",
                     "outer_ce",
-                    "grad_mse",
-                    "lambda_g",
+                    "aux_loss_zero",
+                    "aux_weight_zero",
                 ]
             )
 
@@ -3595,8 +3863,8 @@ class Rater(Algorithm):
                     "meta_step",
                     "total_meta_loss",
                     "outer_ce",
-                    "grad_mse",
-                    "lambda_g",
+                    "aux_loss_zero",
+                    "aux_weight_zero",
                     "score_mean",
                     "score_std",
                     "mean_inner_loss",
@@ -3639,7 +3907,7 @@ class Rater(Algorithm):
 
         log(
             f"[Rater] Meta-training complete. "
-            f"Best TOTAL meta loss={best_meta_loss:.6f}; "
+            f"Best outer classification CE={best_meta_loss:.6f}; "
             f"restored step "
             f"{checkpoint.get('meta_step', 'unknown')}."
         )
