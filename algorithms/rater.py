@@ -119,35 +119,18 @@ class Rater(Algorithm):
 
     Inner update:
 
-        First, the CURRENT inner classifier predicts each sample.
-
-        If the prediction is CORRECT:
-            w_i = 1
-
-        If the prediction is WRONG:
-            the Rater is evaluated ONLY for that misclassified sample,
-            and its raw score is converted to a rating using the selected
-            Rater transform:
+        The Rater evaluates EVERY sample in the current training batch.
+        Raw scores are transformed over the full batch:
 
             SOFTMAX:
-                r_i = softmax((score_i - mean_misclassified) / tau)
+                w_i = softmax((score_i - mean_batch) / tau)
 
             SIGMOID:
-                standardized_i =
-                    (score_i - mean_misclassified)
-                    / (std_misclassified + eps)
-                r_i = sigmoid(standardized_i / tau)
+                standardized_i = (score_i - mean_batch) / (std_batch + eps)
+                w_i = sigmoid(standardized_i / tau)
 
-            Then:
-                w_i = r_i
-
-        Thus the effective weight follows the Evidential-Alignment-style gate:
-
-            w_i = 1                         if prediction is correct
-            w_i = RaterRating(z_i)          if prediction is wrong
-
-        The Rater is NOT used to determine the training weight of correctly
-        classified samples.
+        Correctness is used only for diagnostics; correctly classified
+        samples receive learned ratings rather than a fixed weight of 1.
 
         The requested weighted objective is retained:
 
@@ -174,9 +157,7 @@ class Rater(Algorithm):
             val_subset2 -> model selection,
             test        -> diagnostic evaluation after every final epoch;
       * test metrics are NEVER used for checkpoint selection;
-      * trains a fresh final classifier with EA-style dynamic weighting:
-            correct -> 1,
-            misclassified -> trained-Rater rating;
+      * trains a fresh final classifier with Rater ratings for every sample;
       * saves the ACTUAL final-classifier weight histograms every epoch;
       * selects the downstream classifier by validation WGA by default;
       * evaluates the final classifier on validation/test splits;
@@ -489,15 +470,8 @@ class Rater(Algorithm):
         )
 
         # ----------------------------------------------------
-        # Rater-rating transform for MISCLASSIFIED samples only.
-        #
-        # Correctly classified samples always receive weight = 1.
-        # Misclassified samples receive a Rater-derived rating using the
-        # selected softmax/sigmoid transform.
-        #
-        # Effective training rule:
-        #       weight_i = 1                  if correct
-        #       weight_i = rater_rating_i     if misclassified
+        # Rater-rating transform for ALL samples in each batch.
+        # Every sample receives a learned rating regardless of correctness.
         #
         # Inner loss remains:
         #       sum_i weight_i * CE_i
@@ -585,10 +559,8 @@ class Rater(Algorithm):
                 "RATER_INNER_INIT_NOISE_STD must be >= 0."
             )
 
-        # This experiment uses the EA-style gate from the supplied Rater:
-        #   correct prediction -> weight 1
-        #   wrong prediction   -> Rater-derived rating
-        self.rate_all_samples = False
+        # Every training sample receives a Rater-derived rating.
+        self.rate_all_samples = True
 
         self.rater_capacity = getattr(
             self.config, "rater_capacity", "medium"
@@ -732,12 +704,12 @@ class Rater(Algorithm):
         self.final_classifier = None
 
         log(
-            f"[Rater] EA-style Rater transform = "
+            f"[Rater] All-sample Rater transform = "
             f"{self.weighting}; temperature = {self.temperature}"
         )
         log(
-            "[Rater] EA-style gate: correct samples get weight=1; "
-            "only misclassified samples use the Rater rating."
+            "[Rater] Every sample uses the Rater rating, "
+            "regardless of classifier correctness."
         )
         log(
             "[Rater] Inner objective: L_inner = sum_i w_i * CE_i "
@@ -1234,8 +1206,7 @@ class Rater(Algorithm):
         """
         Convert raw Rater outputs into ratings in (0, 1).
 
-        In the EA-style rule this function is applied to MISCLASSIFIED
-        samples only. Correct samples receive weight exactly 1.
+        The transform is applied over every sample in the current batch.
         """
 
         if raw_scores.numel() == 0:
@@ -1295,71 +1266,6 @@ class Rater(Algorithm):
             raw_scores,
         )
 
-
-    def _ea_style_training_weights(
-        self,
-        z,
-        y,
-        logits,
-        raw_scores_all=None,
-    ):
-        """
-        EA-style training weights from the supplied implementation:
-
-            correct prediction -> weight 1
-            wrong prediction   -> transformed Rater rating
-
-        The Rater is evaluated only on misclassified samples during
-        actual inner training. For diagnostics, raw_scores_all may be
-        supplied and then indexed on the misclassified subset.
-        """
-        pred = logits.argmax(dim=1)
-        correct_mask = pred.eq(y)
-        misclassified_mask = ~correct_mask
-
-        weights = torch.ones(
-            y.shape[0],
-            device=logits.device,
-            dtype=logits.dtype,
-        )
-
-        if not bool(misclassified_mask.any()):
-            empty_scores = torch.empty(
-                0,
-                device=logits.device,
-                dtype=logits.dtype,
-            )
-            return weights, correct_mask, empty_scores
-
-        misclassified_indices = torch.nonzero(
-            misclassified_mask,
-            as_tuple=False,
-        ).squeeze(1)
-
-        if raw_scores_all is None:
-            misclassified_raw_scores = self.rater(
-                z[misclassified_mask]
-            )
-        else:
-            misclassified_raw_scores = raw_scores_all[
-                misclassified_mask
-            ]
-
-        misclassified_ratings = self._scores_to_weights(
-            misclassified_raw_scores
-        )
-
-        weights = weights.index_copy(
-            0,
-            misclassified_indices,
-            misclassified_ratings,
-        )
-
-        return (
-            weights,
-            correct_mask,
-            misclassified_raw_scores,
-        )
 
     # ========================================================
     # Differentiable inner optimization
@@ -1553,11 +1459,9 @@ class Rater(Algorithm):
         train_loader,
     ):
         """
-        Differentiable FULL-EPOCH EA-style weighted classifier optimization.
+        Differentiable FULL-EPOCH Rater-weighted classifier optimization.
 
-        On each batch:
-            correct -> weight 1
-            wrong   -> Rater rating
+        On each batch, every sample receives a Rater rating.
 
         Inner objective:
             L_inner = SUM_i weight_i * CE_i
@@ -1602,8 +1506,8 @@ class Rater(Algorithm):
                 reduction="none",
             )
 
-            weights, _, misclassified_raw_scores = (
-                self._ea_style_training_weights(
+            weights, _, raw_scores = (
+                self._all_sample_training_weights(
                     z=z,
                     y=y,
                     logits=logits,
@@ -1640,7 +1544,7 @@ class Rater(Algorithm):
                 - self.inner_lr * grad_b
             )
 
-            last_raw_scores = misclassified_raw_scores
+            last_raw_scores = raw_scores
 
         return (
             {
@@ -1888,11 +1792,9 @@ class Rater(Algorithm):
     def _score_loss_relationship(self, dataset, models=None):
         """
         Diagnostic relationship between raw Rater scores, effective
-        EA-style weights, classifier loss, and correctness.
+        all-sample Rater weights, classifier loss, and correctness.
 
-        For each inner model:
-            correct -> weight 1
-            wrong   -> Rater rating
+        Every sample receives a Rater rating for each inner model.
 
         `final_scores` is the mean effective weight across the current
         inner-model population.
@@ -2194,9 +2096,8 @@ class Rater(Algorithm):
             histogram of unrestricted rater outputs r_eta(z).
 
         score_kind="final":
-            histogram of the EFFECTIVE EA-STYLE WEIGHT actually used:
-            correct samples have weight 1; misclassified samples use the
-            selected Rater rating transform.
+            histogram of the effective training weight actually used:
+            every sample uses the selected Rater rating transform.
 
         Density normalization is used so strongly imbalanced Waterbirds
         groups can be compared by distribution shape rather than count.
@@ -3787,9 +3688,9 @@ class Rater(Algorithm):
             "",
             f"Meta steps: {self.meta_steps}",
             f"Full inner steps per meta update: {self.inner_steps}",
-            f"Weighting transform for MISCLASSIFIED samples: {self.weighting}",
+            f"Weighting transform for ALL samples: {self.weighting}",
             f"Temperature: {self.temperature}",
-            "EA-style gate: correct -> 1; wrong -> Rater rating",
+            "All samples receive Rater ratings regardless of correctness",
             f"Inner LR: {self.inner_lr}",
             f"Outer LR: {self.outer_lr}",
             f"Gradient clip: {self.grad_clip}",
@@ -4023,13 +3924,13 @@ class Rater(Algorithm):
         group_trajectory = []
 
         self._meta_log(
-            "[Rater] EA-style gate: correct -> 1; "
-            "misclassified -> Rater rating."
+            "[Rater] All samples receive Rater ratings "
+            "regardless of correctness."
         )
         self._meta_log(
             f"[Rater] meta_steps={self.meta_steps}, "
             f"inner_models={self.num_inner_models}, "
-            f"misclassified_weighting={self.weighting}, "
+            f"all_sample_weighting={self.weighting}, "
             f"inner_lr={self.inner_lr}, "
             f"outer_lr={self.outer_lr}, "
             f"temperature={self.temperature}, "
@@ -4174,8 +4075,9 @@ class Rater(Algorithm):
                 "rater_capacity": str(self.rater_capacity),
                 "weighting": str(self.weighting),
                 "temperature": float(self.temperature),
-                "ea_style_gate": "correct=1; wrong=RaterRating",
-                "rater_applied_only_to_misclassified": True,
+                "ea_style_gate": "all=RaterRating",
+                "rate_all_samples": True,
+                "rater_applied_only_to_misclassified": False,
                 "inner_models": 2,
                 "inner_initialization": "independent_random_linear",
                 "full_train_epoch_before_each_meta_update": True,
