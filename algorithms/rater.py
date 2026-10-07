@@ -1,6 +1,7 @@
 import os
 import csv
 import hashlib
+import math
 
 import matplotlib
 matplotlib.use("Agg")
@@ -140,8 +141,17 @@ class Rater(Algorithm):
 
         theta' = theta - alpha * grad_theta L_inner
 
-    Outer update:
-        L_outer = CE(h_theta'(z_val), y_val)
+    Outer update (class-wise hard-loss tail; NO group annotations):
+        For each class c in the outer split, compute per-example CE losses,
+        keep the top p percent within that CLASS, average them, then average
+        the class-tail means equally across classes:
+
+            T_c = TopK({CE_i : y_i=c}, ceil(p * n_c))
+            L_outer = mean_c mean(T_c)
+
+        Group/background annotations are never used in this outer objective.
+        They remain available only for diagnostics/plots.
+
         eta <- eta - beta * grad_eta L_outer
 
     In addition to learning the rater, this implementation:
@@ -456,6 +466,36 @@ class Rater(Algorithm):
                 ),
             )
         )
+
+        # ----------------------------------------------------
+        # Class-wise hard-tail outer objective.
+        #
+        # Example: 30 means that, independently within class 0 and class 1,
+        # the 30% highest-CE outer examples are kept. The mean tail loss is
+        # computed per class, then the class means are averaged equally.
+        # Group/background annotations are NOT used.
+        # ----------------------------------------------------
+        self.outer_top_loss_percent = float(
+            os.environ.get(
+                "RATER_OUTER_TOP_LOSS_PERCENT",
+                str(
+                    getattr(
+                        self.config,
+                        "rater_outer_top_loss_percent",
+                        30.0,
+                    )
+                ),
+            )
+        )
+
+        if not (0.0 < self.outer_top_loss_percent <= 100.0):
+            raise ValueError(
+                "RATER_OUTER_TOP_LOSS_PERCENT must be in (0, 100]."
+            )
+
+        self.outer_top_loss_fraction = (
+            self.outer_top_loss_percent / 100.0
+        )
         self.temperature = float(
             os.environ.get(
                 "RATER_TEMPERATURE",
@@ -513,31 +553,25 @@ class Rater(Algorithm):
         self.score_reg_weight = 0.0
 
         # ----------------------------------------------------
-        # First ERM-initialized Rater experiment
+        # Current Rater experiment
         # ----------------------------------------------------
         #
-        # Rater meta-objective:
+        # Inner models:
+        #   two persistent, independently random Linear(feature_dim, C)
+        #   classifiers. They are NOT initialized from the saved ERM head.
         #
-        #       L_meta = CE(
-        #           h_theta'(z_outer),
-        #           y_outer
-        #       )
+        # Inner loss:
+        #   every training sample receives a Rater-derived weight, and
+        #   L_inner = SUM_i w_i * CE_i.
+        #
+        # Outer/Rater loss:
+        #   class-wise top-loss tail on the outer split. For each class,
+        #   take the top self.outer_top_loss_percent percent CE losses, mean
+        #   them, then average the class-tail means equally. No group labels
+        #   are used by the outer objective.
         #
         # There is NO gradient-magnitude auxiliary loss and no additional
-        # Rater regularizer in the meta objective for this experiment.
-        #
-        # The inner classifiers start from the SAVED ERM classifier:
-        #
-        #   inner model 0:
-        #       exact ERM classifier weights
-        #
-        #   inner models 1,2,...:
-        #       ERM classifier + very small Gaussian perturbation
-        #
-        # This keeps the two-model population near the same useful ERM
-        # solution without making their meta-trajectories exactly identical.
-        # With RATER_NUM_INNER_MODELS=1, the sole inner model is the exact
-        # saved ERM classifier.
+        # Rater regularizer in the meta objective.
         # ----------------------------------------------------
         self.grad_loss_weight = 0.0
 
@@ -716,8 +750,9 @@ class Rater(Algorithm):
             "WITHOUT dividing by sum(w)."
         )
         log(
-            "[Rater] Meta objective = OUTER CLASSIFICATION "
-            "CROSS-ENTROPY ONLY."
+            f"[Rater] Meta objective = class-wise top "
+            f"{self.outer_top_loss_percent:g}% outer CE tail; "
+            "class means are averaged equally; group labels are NOT used."
         )
         log(
             f"[Rater] Inner population = {self.num_inner_models}; "
@@ -1557,8 +1592,90 @@ class Rater(Algorithm):
         )
 
     # ========================================================
-    # One bilevel/meta step
+    # Class-wise top-loss outer objective + one bilevel/meta step
     # ========================================================
+
+    def _classwise_top_loss_outer_objective(
+        self,
+        per_sample_losses,
+        labels,
+    ):
+        """
+        Class-balanced hard-tail outer objective using CLASS labels only.
+
+        For each class c:
+            1. collect outer CE losses with y == c;
+            2. keep k_c = ceil(p * n_c) highest-loss examples;
+            3. compute the mean of those selected losses.
+
+        The final Rater loss is the UNWEIGHTED mean of the per-class tail
+        means, so each class contributes equally even when class counts differ.
+
+        No group/background annotation is read or used here.
+        """
+        if per_sample_losses.ndim != 1:
+            raise ValueError(
+                "per_sample_losses must be a 1-D tensor."
+            )
+
+        if labels.ndim != 1:
+            labels = labels.reshape(-1)
+
+        if per_sample_losses.shape[0] != labels.shape[0]:
+            raise ValueError(
+                "Loss and label tensors must have the same length."
+            )
+
+        class_tail_means = []
+        stats = {}
+
+        for class_id_tensor in torch.unique(labels):
+            class_id = int(class_id_tensor.item())
+            class_mask = labels.eq(class_id_tensor)
+            class_losses = per_sample_losses[class_mask]
+            n_class = int(class_losses.numel())
+
+            if n_class == 0:
+                continue
+
+            k = max(
+                1,
+                int(
+                    math.ceil(
+                        self.outer_top_loss_fraction * n_class
+                    )
+                ),
+            )
+            k = min(k, n_class)
+
+            top_losses = torch.topk(
+                class_losses,
+                k=k,
+                largest=True,
+                sorted=False,
+            ).values
+
+            class_tail_mean = top_losses.mean()
+            class_tail_means.append(class_tail_mean)
+
+            stats[class_id] = {
+                "n_class": n_class,
+                "k_selected": k,
+                "tail_mean": float(
+                    class_tail_mean.detach().item()
+                ),
+            }
+
+        if not class_tail_means:
+            raise RuntimeError(
+                "Outer batch/split contained no labeled examples."
+            )
+
+        outer_loss = torch.stack(
+            class_tail_means
+        ).mean()
+
+        return outer_loss, stats
 
     def _meta_step(
         self,
@@ -1568,32 +1685,33 @@ class Rater(Algorithm):
         val_loader,
     ):
         """
-        One classification-only Rater update.
+        One Rater update with a class-wise hard-tail outer objective.
 
-        BOTH persistent inner models complete self.inner_steps batches
-        before the single optimizer.step() on the Rater. Since train() sets
-        self.inner_steps = len(train_loader), both models see the entire
-        training set once before every Rater update.
+        BOTH persistent inner models first complete self.inner_steps batches.
+        train() sets self.inner_steps = len(train_loader), so each inner model
+        sees the entire train_no_aug set once before the Rater update.
 
-        For memory efficiency, each model's outer loss / num_models is
-        backpropagated immediately, accumulating Rater gradients. The Rater
-        optimizer step happens only after BOTH models are finished.
+        After an inner model finishes its full training pass, its outer
+        per-example CE losses are computed on the ENTIRE outer split. For each
+        class independently, only the top p% highest-loss samples are retained.
+        The per-class tail means are then averaged equally:
+
+            L_outer = mean_c mean(Top_{p%}(CE_i | y_i=c))
+
+        Group annotations are ignored completely in this objective.
+
+        For memory efficiency, each inner model's outer loss / num_models is
+        backpropagated immediately. The Rater optimizer step happens only after
+        both inner models have completed their full inner epoch and outer loss.
         """
+        del val_iterator
+
         self.rater.train()
-
-        outer_batch, val_iterator = self._next_batch(
-            val_iterator,
-            val_loader,
-        )
-
-        z_outer, y_outer, _, _ = outer_batch
-        z_outer = z_outer.to(self.device, non_blocking=True)
-        y_outer = y_outer.to(self.device, non_blocking=True)
-
         self.outer_optimizer.zero_grad()
 
         outer_values = []
         committed_fast_params = []
+        per_model_tail_stats = []
 
         for inner_model in self.inner_models:
             (
@@ -1607,15 +1725,50 @@ class Rater(Algorithm):
                 train_loader,
             )
 
-            outer_logits = F.linear(
-                z_outer,
-                fast_params["weight"],
-                fast_params["bias"],
+            # Collect outer per-example losses over the ENTIRE outer split.
+            # The third/fourth fields (group/background metadata) are ignored.
+            all_outer_losses = []
+            all_outer_labels = []
+
+            for z_outer, y_outer, _, _ in val_loader:
+                z_outer = z_outer.to(
+                    self.device,
+                    non_blocking=True,
+                )
+                y_outer = y_outer.to(
+                    self.device,
+                    non_blocking=True,
+                )
+
+                outer_logits = F.linear(
+                    z_outer,
+                    fast_params["weight"],
+                    fast_params["bias"],
+                )
+
+                per_outer_loss = F.cross_entropy(
+                    outer_logits,
+                    y_outer,
+                    reduction="none",
+                )
+
+                all_outer_losses.append(per_outer_loss)
+                all_outer_labels.append(y_outer)
+
+            per_outer_loss = torch.cat(
+                all_outer_losses,
+                dim=0,
+            )
+            y_outer_all = torch.cat(
+                all_outer_labels,
+                dim=0,
             )
 
-            outer_loss = F.cross_entropy(
-                outer_logits,
-                y_outer,
+            outer_loss, tail_stats = (
+                self._classwise_top_loss_outer_objective(
+                    per_sample_losses=per_outer_loss,
+                    labels=y_outer_all,
+                )
             )
 
             (
@@ -1625,6 +1778,7 @@ class Rater(Algorithm):
             outer_values.append(
                 float(outer_loss.detach().item())
             )
+            per_model_tail_stats.append(tail_stats)
 
             committed_fast_params.append(
                 {
@@ -1653,14 +1807,20 @@ class Rater(Algorithm):
                     fast_params["bias"]
                 )
 
-        outer_ce = float(np.mean(outer_values))
+        outer_top_class_loss = float(
+            np.mean(outer_values)
+        )
+
+        self._last_outer_tail_stats = (
+            per_model_tail_stats
+        )
 
         return (
-            outer_ce,
-            outer_ce,
+            outer_top_class_loss,
+            outer_top_class_loss,
             0.0,
             train_iterator,
-            val_iterator,
+            iter(val_loader),
         )
 
     # ========================================================
@@ -2090,35 +2250,37 @@ class Rater(Algorithm):
         score_kind="raw",
     ):
         """
-        Save the distribution of Rater outputs separately for every group.
+        Save ONE 5-panel histogram figure.
 
-        score_kind="raw":
-            histogram of unrestricted rater outputs r_eta(z).
+        Layout for Waterbirds:
+            left column, top -> bottom:
+                Group 0 histogram
+                Group 1 histogram
+                Group 2 histogram
+                Group 3 histogram
 
-        score_kind="final":
-            histogram of the effective training weight actually used:
-            every sample uses the selected Rater rating transform.
+            right column (spans all 4 rows):
+                all four groups overlaid in one larger histogram.
 
-        Density normalization is used so strongly imbalanced Waterbirds
-        groups can be compared by distribution shape rather than count.
+        Group annotations are used ONLY for this diagnostic visualization.
+        They are NOT used by the Rater outer/meta loss.
+
+        A common set of bins is shared by all five panels. Density
+        normalization is used so group shapes remain comparable despite
+        Waterbirds group-size imbalance.
         """
-
         if score_kind == "raw":
             values = np.asarray(relationship["scores"])
             folder = "raw_score_histogram"
-            xlabel = "Raw rater score"
+            xlabel = "Raw Rater score"
             title_name = "Raw Rater score distribution"
             filename_kind = "raw_score_hist"
         elif score_kind == "final":
             values = np.asarray(relationship["final_scores"])
             folder = f"final_score_histogram_{self.weighting}"
-            xlabel = (
-                "Effective EA-GATED Rater weight "
-                "(every sample=Rater weight)"
-            )
+            xlabel = f"All-sample {self.weighting} Rater weight"
             title_name = (
-                f"EA-GATED Rater weight distribution "
-                f"(wrong uses {self.weighting})"
+                f"All-sample {self.weighting} Rater-weight distribution"
             )
             filename_kind = "final_score_hist"
         else:
@@ -2135,45 +2297,126 @@ class Rater(Algorithm):
         )
         os.makedirs(plot_dir, exist_ok=True)
 
-        fig, ax = plt.subplots(figsize=(10, 7))
-
         if len(values) == 0:
-            plt.close(fig)
             return None
 
-        vmin = float(np.min(values))
-        vmax = float(np.max(values))
+        finite = values[np.isfinite(values)]
+        if len(finite) == 0:
+            return None
+
+        vmin = float(np.min(finite))
+        vmax = float(np.max(finite))
+
         if np.isclose(vmin, vmax):
             eps = max(abs(vmin) * 0.05, 1e-6)
             bins = np.linspace(vmin - eps, vmax + eps, 20)
         else:
             bins = np.linspace(vmin, vmax, 41)
 
-        for gid in sorted(np.unique(groups)):
+        # Waterbirds has exactly four group IDs 0,1,2,3. Keep the requested
+        # four fixed left panels even if a diagnostic split happens to have
+        # no sample from one group.
+        if self.config.dataset == "waterbirds":
+            group_ids = [0, 1, 2, 3]
+        else:
+            group_ids = list(sorted(np.unique(groups)))[:4]
+            while len(group_ids) < 4:
+                group_ids.append(None)
+
+        fig = plt.figure(
+            figsize=(16, 12)
+        )
+        grid = fig.add_gridspec(
+            nrows=4,
+            ncols=2,
+            width_ratios=[1.0, 2.15],
+            hspace=0.50,
+            wspace=0.28,
+        )
+
+        # Four separate histograms on the left.
+        for row, gid in enumerate(group_ids):
+            ax = fig.add_subplot(
+                grid[row, 0]
+            )
+
+            if gid is None:
+                ax.axis("off")
+                continue
+
             mask = groups == gid
             group_values = values[mask]
+
+            if len(group_values) > 0:
+                ax.hist(
+                    group_values,
+                    bins=bins,
+                    density=True,
+                    alpha=0.80,
+                )
+
+            ax.set_xlim(bins[0], bins[-1])
+            ax.set_ylabel("Density")
+            ax.set_title(
+                f"{self._group_display_name(gid)} (n={int(mask.sum())})",
+                fontsize=10,
+            )
+            ax.grid(
+                True,
+                linestyle=":",
+                alpha=0.25,
+            )
+
+            if row == 3:
+                ax.set_xlabel(xlabel)
+
+        # Large all-group overlay on the right.
+        ax_all = fig.add_subplot(
+            grid[:, 1]
+        )
+
+        for gid in [g for g in group_ids if g is not None]:
+            mask = groups == gid
+            group_values = values[mask]
+
             if len(group_values) == 0:
                 continue
 
-            ax.hist(
+            ax_all.hist(
                 group_values,
                 bins=bins,
                 density=True,
-                alpha=0.45,
+                alpha=0.38,
                 label=(
                     f"{self._group_display_name(gid)} "
                     f"(n={int(mask.sum())})"
                 ),
             )
 
-        ax.set_xlabel(xlabel)
-        ax.set_ylabel("Density")
-        ax.set_title(
-            f"{title_name} by group | {split_name} | step {meta_step}"
+        ax_all.set_xlim(bins[0], bins[-1])
+        ax_all.set_xlabel(xlabel)
+        ax_all.set_ylabel("Density")
+        ax_all.set_title(
+            "All groups overlaid",
+            fontsize=13,
         )
-        ax.grid(True, linestyle=":", alpha=0.30)
-        ax.legend(loc="best", fontsize=9)
-        fig.tight_layout()
+        ax_all.grid(
+            True,
+            linestyle=":",
+            alpha=0.25,
+        )
+        ax_all.legend(
+            loc="best",
+            fontsize=9,
+        )
+
+        fig.suptitle(
+            f"{title_name} | {split_name} | step {meta_step}",
+            fontsize=15,
+        )
+        fig.subplots_adjust(
+            top=0.94
+        )
 
         plot_path = os.path.join(
             plot_dir,
@@ -2187,7 +2430,7 @@ class Rater(Algorithm):
         plt.close(fig)
 
         log(
-            f"[Rater plot] saved {score_kind}-score histogram: "
+            f"[Rater plot] saved 5-panel {score_kind}-score histogram: "
             f"{plot_path}"
         )
         return plot_path
@@ -2256,11 +2499,11 @@ class Rater(Algorithm):
             "Mean per-example cross-entropy loss across inner models"
         )
         ax.set_ylabel(
-            "Effective EA-style weight (every sample=Rater weight)"
+            "All-sample Rater weight"
         )
         ax.set_title(
-            f"EA-GATED Rater weight vs inner-model loss "
-            f"(wrong uses {self.weighting}) | "
+            f"All-sample Rater weight vs inner-model loss "
+            f"({self.weighting} on every sample) | "
             f"{split_name} | "
             f"step {meta_step}\n"
             f"Spearman={relationship['spearman_final_score_vs_loss']:.3f}, "
@@ -3562,8 +3805,8 @@ class Rater(Algorithm):
             steps = np.asarray(
                 [row["step"] for row in history]
             )
-            outer_ce = np.asarray(
-                [row["outer_ce"] for row in history]
+            outer_tail_loss = np.asarray(
+                [row["outer_top_class_loss"] for row in history]
             )
 
             fig, ax = plt.subplots(
@@ -3571,12 +3814,16 @@ class Rater(Algorithm):
             )
             ax.plot(
                 steps,
-                outer_ce,
+                outer_tail_loss,
                 linewidth=1.8,
             )
             ax.set_xlabel("Meta step")
-            ax.set_ylabel("Outer classification CE")
-            ax.set_title("Rater meta objective")
+            ax.set_ylabel(
+                f"Class-wise top {self.outer_top_loss_percent:g}% outer CE"
+            )
+            ax.set_title(
+                "Rater meta objective: per-class hard-loss tail"
+            )
             ax.grid(
                 True,
                 linestyle=":",
@@ -3586,7 +3833,7 @@ class Rater(Algorithm):
             fig.savefig(
                 os.path.join(
                     plot_dir,
-                    "outer_classification_ce.png",
+                    "outer_classwise_top_loss.png",
                 ),
                 dpi=160,
                 bbox_inches="tight",
@@ -3665,7 +3912,7 @@ class Rater(Algorithm):
         self,
         output_dir,
         best_step,
-        best_outer_ce,
+        best_outer_tail_loss,
         final_relationships,
         final_metrics,
     ):
@@ -3696,9 +3943,20 @@ class Rater(Algorithm):
             f"Gradient clip: {self.grad_clip}",
             "Inner objective: SUM_i weight_i * CE_i",
             "Divide by sum(weights): NO",
-            "Rater meta objective: OUTER CLASSIFICATION CE ONLY",
+            (
+                "Rater meta objective: class-wise top-loss outer CE; "
+                "NO group annotations"
+            ),
+            (
+                f"Outer top-loss percentage per class: "
+                f"{self.outer_top_loss_percent:g}%"
+            ),
+            (
+                "Outer aggregation: mean selected CE within each class, "
+                "then equal mean across classes"
+            ),
             f"Best meta step: {best_step}",
-            f"Best outer CE: {best_outer_ce:.8f}",
+            f"Best outer class-tail loss: {best_outer_tail_loss:.8f}",
             "",
             "FINAL INNER-POPULATION METRICS",
             "-" * 88,
@@ -3792,7 +4050,8 @@ class Rater(Algorithm):
         """
         Train ONLY the Rater.
 
-        No final classifier is trained here.
+        No final classifier is trained here. The outer/Rater objective is the
+        configurable class-wise top-loss CE tail and never uses group labels.
 
         Crucial full-epoch rule:
             self.inner_steps = len(train_loader)
@@ -3884,7 +4143,7 @@ class Rater(Algorithm):
         val_loader = DataLoader(
             val_dataset,
             batch_size=self.config.batch_size,
-            shuffle=True,
+            shuffle=False,
             num_workers=self.config.num_workers,
             pin_memory=True,
         )
@@ -3916,7 +4175,7 @@ class Rater(Algorithm):
 
         self._initialize_inner_population()
 
-        best_outer_ce = float("inf")
+        best_outer_tail_loss = float("inf")
         best_step = None
         best_rater_state = None
 
@@ -3928,12 +4187,19 @@ class Rater(Algorithm):
             "regardless of correctness."
         )
         self._meta_log(
+            f"[Rater] Outer/Rater loss = top "
+            f"{self.outer_top_loss_percent:g}% highest CE PER CLASS over "
+            "the full outer split; class tail means are averaged equally; "
+            "group annotations are NOT used in the loss."
+        )
+        self._meta_log(
             f"[Rater] meta_steps={self.meta_steps}, "
             f"inner_models={self.num_inner_models}, "
             f"all_sample_weighting={self.weighting}, "
             f"inner_lr={self.inner_lr}, "
             f"outer_lr={self.outer_lr}, "
             f"temperature={self.temperature}, "
+            f"outer_top_loss_percent={self.outer_top_loss_percent:g}, "
             f"grad_clip={self.grad_clip}"
         )
 
@@ -3943,7 +4209,7 @@ class Rater(Algorithm):
         ):
             (
                 total_meta_loss,
-                outer_ce,
+                outer_top_class_loss,
                 _,
                 train_iterator,
                 val_iterator,
@@ -3957,12 +4223,34 @@ class Rater(Algorithm):
             history.append(
                 {
                     "step": int(meta_step),
-                    "outer_ce": float(outer_ce),
+                    "outer_top_class_loss": float(outer_top_class_loss),
                 }
             )
 
-            if outer_ce < best_outer_ce:
-                best_outer_ce = float(outer_ce)
+            tail_parts = []
+            if getattr(self, "_last_outer_tail_stats", None):
+                # Counts are the same for both inner models because the full
+                # outer split is used; report model 0 for a concise live line.
+                for class_id, stat in sorted(
+                    self._last_outer_tail_stats[0].items()
+                ):
+                    tail_parts.append(
+                        f"c{class_id}:top{stat['k_selected']}/{stat['n_class']}"
+                    )
+
+            self._meta_log(
+                f"[META {meta_step:03d}/{self.meta_steps}] "
+                f"outer_top_{self.outer_top_loss_percent:g}%="
+                f"{outer_top_class_loss:.6f}"
+                + (
+                    " | " + ", ".join(tail_parts)
+                    if tail_parts
+                    else ""
+                )
+            )
+
+            if outer_top_class_loss < best_outer_tail_loss:
+                best_outer_tail_loss = float(outer_top_class_loss)
                 best_step = int(meta_step)
                 best_rater_state = {
                     key: value.detach().cpu().clone()
@@ -4013,7 +4301,8 @@ class Rater(Algorithm):
 
                 self._meta_log(
                     f"[step {meta_step:04d}] "
-                    f"outer_ce={outer_ce:.6f}, "
+                    f"outer_top_{self.outer_top_loss_percent:g}pct_per_class="
+                    f"{outer_top_class_loss:.6f}, "
                     f"mean_inner_acc="
                     f"{100.0 * population_metrics['mean_accuracy']:.2f}%, "
                     f"mean_inner_WGA="
@@ -4054,7 +4343,7 @@ class Rater(Algorithm):
 
         self._meta_log(
             f"[Rater] restored best step={best_step}, "
-            f"best_outer_ce={best_outer_ce:.8f}"
+            f"best_outer_class_tail_loss={best_outer_tail_loss:.8f}"
         )
 
         # Save ONE compact reusable model.
@@ -4068,7 +4357,14 @@ class Rater(Algorithm):
                 "rater_sd": self.rater.state_dict(),
                 "meta_steps": int(self.meta_steps),
                 "best_meta_step": int(best_step),
-                "best_outer_ce": float(best_outer_ce),
+                "best_outer_class_tail_loss": float(best_outer_tail_loss),
+                "outer_top_loss_percent_per_class": float(
+                    self.outer_top_loss_percent
+                ),
+                "outer_loss_uses_group_annotations": False,
+                "outer_loss_class_aggregation": (
+                    "equal_mean_of_per_class_top_tail_means"
+                ),
                 "feature_dim": int(self.feature_dim),
                 "num_classes": int(self.n_classes),
                 "backbone": str(self.config.backbone),
@@ -4147,7 +4443,7 @@ class Rater(Algorithm):
         summary_path = self._write_meta_summary(
             output_dir=output_dir,
             best_step=best_step,
-            best_outer_ce=best_outer_ce,
+            best_outer_tail_loss=best_outer_tail_loss,
             final_relationships=final_relationships,
             final_metrics=final_metrics,
         )
@@ -4178,4 +4474,3 @@ class Rater(Algorithm):
             "[Rater] Meta-learning-only run complete. "
             "No final classifier is trained in this rater.py."
         )
-
