@@ -131,3 +131,11 @@ wilds/
 .vscode/
 *.jpg
 *.png   
+
+combine_py_to_markdown.py
+.DS_Store
+all_python_code.md
+
+*.tex
+
+*.ipynb

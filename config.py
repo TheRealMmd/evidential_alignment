@@ -617,6 +617,43 @@ def rater_args(parser):
     )
 
     parser.add_argument(
+        "--rater_outer_loss",
+        type=str,
+        default="classwise_top_loss",
+        choices=[
+            "classwise_top_loss",
+            "class_balanced",
+            "worst_class_loss",
+            "logsumexp",
+        ],
+        help=(
+            "outer objective used to update the Rater: class-wise top-loss, "
+            "class-balanced mean loss, worst-class mean loss, or normalized "
+            "log-sum-exp over all outer examples"
+        ),
+    )
+
+    parser.add_argument(
+        "--rater_outer_top_loss_percent",
+        type=float,
+        default=30.0,
+        help=(
+            "per-class highest-loss fraction in percent when "
+            "rater_outer_loss=classwise_top_loss"
+        ),
+    )
+
+    parser.add_argument(
+        "--rater_outer_lse_beta",
+        type=float,
+        default=1.0,
+        help=(
+            "positive beta temperature for rater_outer_loss=logsumexp; "
+            "larger values emphasize higher-loss examples"
+        ),
+    )
+
+    parser.add_argument(
         "--rater_temperature",
         type=float,
         default=2.0,
