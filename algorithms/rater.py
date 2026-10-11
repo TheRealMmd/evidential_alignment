@@ -1,7 +1,35 @@
+"""Meta-train a rater and export final_rater.pt for independent downstream use.
+
+The existing per-group/overlaid histogram layout, scatter plots and box/ECDF
+plots are preserved. Inner-model accuracy, WGA, mean CE and worst-group mean CE
+are recorded on train/outer-validation/test (plus held-out validation if present).
+Existing eval_freq, RATER_EVAL_FREQ, RATER_PLOT_FREQ and save_freq control cadence;
+no new training settings or automatic sensitivity sweeps are introduced.
+
+Metric/source data live in plots/data/, Grad-CAM images/arrays in plots/gradcam/,
+and full population checkpoints in plots/checkpoints/. The existing notebook's
+copy of plots/ preserves them. final_rater.pt remains a compact rater checkpoint.
+Grad-CAM uses one fixed image per observed group for the selected rater and inner
+models. The downstream classifier and its diagnostics belong to its notebook.
+
+Offline plotting (no training or configuration changes):
+  python algorithms/rater.py --runs RUN_SEED0 RUN_SEED1 --output MULTISEED_DIR
+  python algorithms/rater.py --runs RUN_A RUN_B --output COMPARISON_DIR --compare calibration_size
+  python algorithms/rater.py --runs RUN_A RUN_B --output COMPARISON_DIR --compare initial_wga
+Comparisons describe observed inner-model outcomes across existing runs; they do
+not create controlled sensitivity experiments or evaluate a downstream model.
+"""
+
 import os
 import csv
+import copy
 import hashlib
+import json
 import math
+import random
+import time
+from collections import defaultdict
+from contextlib import contextmanager
 
 import matplotlib
 matplotlib.use("Agg")
@@ -15,11 +43,122 @@ from scipy import stats
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 
-from .algorithm import Algorithm
-from .register import register_algorithm
+if __name__ == "__main__":
+    # The plotting CLI needs no dataset registry, pretrained downloads, or timm.
+    Algorithm = nn.Module
 
-from models.classifier import Classifier
-from utils import log
+    def register_algorithm(name):
+        return lambda cls: cls
+else:
+    from .algorithm import Algorithm
+    from .register import register_algorithm
+    from models.classifier import Classifier
+    from utils import log
+
+
+METRIC_FIELDS = ("accuracy", "worst_group_accuracy", "loss", "worst_group_loss")
+METRIC_LABELS = ("Accuracy", "Worst-group accuracy", "Mean CE loss", "Worst-group mean CE loss")
+
+
+def _json_value(value):
+    """Strict JSON, including numpy/tensor scalars and explicit missing values."""
+    if torch.is_tensor(value):
+        return _json_value(value.detach().cpu().tolist())
+    if isinstance(value, np.ndarray):
+        return _json_value(value.tolist())
+    if isinstance(value, np.generic):
+        return _json_value(value.item())
+    if isinstance(value, dict):
+        return {str(k): _json_value(v) for k, v in value.items()}
+    if isinstance(value, (tuple, list)):
+        return [_json_value(v) for v in value]
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    return str(value)
+
+
+def _write_json(path, payload):
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    temp = f"{path}.tmp.{os.getpid()}"
+    with open(temp, "w", encoding="utf-8") as fout:
+        json.dump(_json_value(payload), fout, indent=2, sort_keys=True, allow_nan=False)
+        fout.write("\n")
+    os.replace(temp, path)
+
+
+def _atomic_torch_save(payload, path):
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    temp = f"{path}.tmp.{os.getpid()}"
+    torch.save(payload, temp)
+    os.replace(temp, path)
+
+
+def _append_csv(path, rows):
+    if not rows:
+        return
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    exists = os.path.exists(path) and os.path.getsize(path) > 0
+    with open(path, "a", newline="", encoding="utf-8") as fout:
+        writer = csv.DictWriter(fout, fieldnames=list(rows[0]))
+        if not exists:
+            writer.writeheader()
+        writer.writerows(rows)
+
+
+def _write_csv(path, rows):
+    if not rows:
+        return
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    temp = f"{path}.tmp.{os.getpid()}"
+    with open(temp, "w", newline="", encoding="utf-8") as fout:
+        writer = csv.DictWriter(fout, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+    os.replace(temp, path)
+
+
+@contextmanager
+def _preserve_rng():
+    """Diagnostics and extra experiments must not alter training randomness."""
+    python_state, numpy_state = random.getstate(), np.random.get_state()
+    with torch.random.fork_rng():
+        try:
+            yield
+        finally:
+            random.setstate(python_state)
+            np.random.set_state(numpy_state)
+
+
+def _rng_state():
+    return {"python": random.getstate(), "numpy": np.random.get_state(),
+            "torch": torch.get_rng_state(),
+            "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else []}
+
+
+def _diagnostic_path(output_dir, *parts):
+    return os.path.join(output_dir, "plots", "data", *parts)
+
+
+def _cpu_state(model):
+    return {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+
+
+def _metric_figure(rows, title, xlabel="Step"):
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+    for ax, field, label in zip(axes.flat, METRIC_FIELDS, METRIC_LABELS):
+        for split in sorted({r["split"] for r in rows}):
+            values = sorted((r for r in rows if r["split"] == split),
+                            key=lambda r: float(r["step"]))
+            ax.plot([float(r["step"]) for r in values],
+                    [float(r[field]) for r in values], marker=".", label=split)
+        ax.set(xlabel=xlabel, ylabel=label)
+        ax.grid(alpha=0.25)
+        ax.legend(fontsize=8)
+    fig.suptitle(title)
+    fig.tight_layout()
+    return fig
 
 
 # ============================================================
@@ -29,12 +168,15 @@ from utils import log
 class EmbeddingTensorDataset(Dataset):
     """Dataset of frozen backbone embeddings and Waterbirds metadata."""
 
-    def __init__(self, embeddings, labels, groups, attrs):
+    def __init__(self, embeddings, labels, groups, attrs, sample_indices=None):
         self.embeddings = embeddings.float()
         self.y_array = labels.long()
         self.group_array = groups.long()
         self.confounder_array = attrs.long()
         self.n_classes = int(torch.unique(self.y_array).numel())
+        # Indices in the original, deterministic split/cache order.
+        self.sample_indices = (torch.arange(len(labels)) if sample_indices is None
+                               else torch.as_tensor(sample_indices).long())
 
     def __len__(self):
         return len(self.y_array)
@@ -93,7 +235,7 @@ class EmbeddingRaterMedium(nn.Module):
 
 
 # ============================================================
-# Inner / downstream classifier
+# Inner classifier
 # ============================================================
 
 class InnerLinearClassifier(nn.Module):
@@ -113,60 +255,12 @@ class InnerLinearClassifier(nn.Module):
 
 @register_algorithm("rater")
 class Rater(Algorithm):
-    """
-    Frozen trained feature-Rater used only for final-classifier training.
+    """Learn per-example weights through a group-blind bilevel objective.
 
-    Image x -> frozen Waterbirds-ERM ResNet-50 -> z -> r_eta(z) -> scalar score.
-
-    Inner update:
-
-        The Rater evaluates EVERY sample in the current training batch.
-        Raw scores are transformed over the full batch:
-
-            SOFTMAX:
-                w_i = softmax((score_i - mean_batch) / tau)
-
-            SIGMOID:
-                standardized_i = (score_i - mean_batch) / (std_batch + eps)
-                w_i = sigmoid(standardized_i / tau)
-
-        Correctness is used only for diagnostics; correctly classified
-        samples receive learned ratings rather than a fixed weight of 1.
-
-        The requested weighted objective is retained:
-
-            L_inner = sum_i w_i CE(h_theta(z_i), y_i)
-
-        There is intentionally NO division by sum_i w_i.
-
-        theta' = theta - alpha * grad_theta L_inner
-
-    Outer update uses a configurable group-blind objective: class-wise top-loss,
-    class-balanced mean loss, worst-class mean loss, or normalized log-sum-exp.
-    Group/background annotations are never used in this objective; they remain
-    available only for diagnostics/plots.
-
-        eta <- eta - beta * grad_eta L_outer
-
-    In addition to learning the rater, this implementation:
-      * evaluates the persistent inner-model population during meta-training;
-      * logs average accuracy and worst-group accuracy (WGA);
-      * measures correlation between raw/final Rater training weights and loss;
-      * saves per-group histograms for raw Rater scores and final training weights;
-      * saves raw-score-vs-loss and final-weight-vs-loss scatter plots;
-      * optionally saves intermediate rater/inner-model checkpoints;
-      * after meta-training, restores and saves the BEST trained Rater;
-      * this meta-only version does NOT train the final classifier:
-            val_subset1 -> calibration/training,
-            val_subset2 -> model selection,
-            test        -> diagnostic evaluation after every final epoch;
-      * test metrics are NEVER used for checkpoint selection;
-      * trains a fresh final classifier with Rater ratings for every sample;
-      * saves the ACTUAL final-classifier weight histograms every epoch;
-      * selects the downstream classifier by validation WGA by default;
-      * evaluates the final classifier on validation/test splits;
-      * uses a persistent shared embedding cache so the frozen ERM ResNet-50
-        embeddings are extracted once and reused across timestamped runs.
+    A frozen ERM backbone supplies embeddings. Persistent randomly initialized
+    linear inner models optimize SUM_i weight_i * CE_i for a full training epoch
+    before each rater update. Groups are used only for diagnostics. Training ends
+    by exporting the selected rater; no downstream classifier is trained here.
     """
 
     def __init__(self, config):
@@ -210,8 +304,8 @@ class Rater(Algorithm):
         #       -> saved ERM linear classifier
         #
         # The backbone is frozen after loading. The saved ERM classifier
-        # parameters are also copied and used to initialize the persistent
-        # inner classifiers for Rater meta-learning.
+        # parameters are retained for checkpoint compatibility. The persistent
+        # inner classifiers are initialized independently from scratch.
         # ----------------------------------------------------
         self.erm_model_path = str(
             getattr(
@@ -303,8 +397,7 @@ class Rater(Algorithm):
                 "backbone embedding dimension."
             )
 
-        # Exact ERM classifier parameters used as the base initialization
-        # for the persistent inner classifiers.
+        # Saved ERM head parameters; not used to initialize the inner population.
         self.erm_head_weight = (
             self.feature_model.fc.weight
             .detach()
@@ -657,41 +750,13 @@ class Rater(Algorithm):
             )
         )
 
-        # Save PNGs only. Diagnostic CSVs are disabled to conserve Drive.
+        # Per-sample arrays are saved once in compressed NPZ snapshots below.
+        # Leave the legacy scatter-only CSV exporter disabled to avoid duplication.
         self.save_plot_data = False
 
-        # ----------------------------------------------------
-        # Final weighted classifier hyperparameters.
-        # These have defaults, so config.py does not HAVE to
-        # define them unless you want command-line control.
-        # ----------------------------------------------------
-        self.final_epochs = int(
-            getattr(self.config, "rater_final_epochs", 50)
-        )
-        self.final_lr = float(
-            getattr(self.config, "rater_final_lr", 1e-2)
-        )
-        self.final_momentum = float(
-            getattr(self.config, "rater_final_momentum", 0.9)
-        )
-        self.final_weight_decay = float(
-            getattr(self.config, "rater_final_weight_decay", 1e-4)
-        )
-        # For robustness experiments we select the downstream
-        # classifier by held-out validation WGA by default.
-        #
-        # NOTE: WGA selection uses validation group labels. If you want a
-        # group-label-free selection rule, set rater_final_selection to
-        # "accuracy" or "loss" in config.py.
-        self.final_selection = str(
-            getattr(self.config, "rater_final_selection", "wga")
-        ).lower()
-
-        # Save final-classifier weight histograms every epoch by default.
-        # No config.py change is required.
-        self.final_plot_freq = int(
-            getattr(self.config, "rater_final_plot_freq", 1)
-        )
+        self.save_freq = int(getattr(self.config, "save_freq", 0))
+        if min(self.meta_steps, self.eval_freq, self.plot_freq) < 1:
+            raise ValueError("Training length and evaluation/plot frequencies must be positive.")
 
         if self.inner_steps < 1:
             raise ValueError("rater_inner_steps must be >= 1.")
@@ -705,39 +770,9 @@ class Rater(Algorithm):
                 "rater_weighting must be either 'softmax' or 'sigmoid'."
             )
 
-        if self.final_selection not in {"accuracy", "wga", "loss"}:
-            raise ValueError(
-                "rater_final_selection must be one of: accuracy, wga, loss"
-            )
-
-        if self.final_plot_freq < 1:
-            raise ValueError("rater_final_plot_freq must be >= 1.")
-
-        # ----------------------------------------------------
-        # EA-style calibration protocol for the FINAL classifier
-        # ----------------------------------------------------
-        #
-        # With --split_val < 1, prepare_data() creates:
-        #
-        #   val_subset1 -> calibration set
-        #   val_subset2 -> held-out selection set
-        #
-        # This updated Rater uses:
-        #
-        #   * original train_no_aug for inner-model training
-        #   * val_subset1 as the Rater outer/calibration signal
-        #   * val_subset1 to train the fresh final classifier
-        #   * val_subset2 only for final-classifier checkpoint selection
-        #   * test only for final reporting
-        #
-        # This keeps val_subset2 untouched during Rater meta-training.
-        # ----------------------------------------------------
-        self.use_calibration_final = bool(
-            getattr(
-                self.config,
-                "rater_use_calibration_final",
-                True,
-            )
+        # Preserve the existing calibration-split behavior and legacy option.
+        self.use_calibration_split = bool(
+            getattr(self.config, "rater_use_calibration_final", True)
         )
 
         # ----------------------------------------------------
@@ -757,7 +792,6 @@ class Rater(Algorithm):
         )
 
         self.inner_models = []
-        self.final_classifier = None
 
         log(
             f"[Rater] All-sample Rater transform = "
@@ -1026,6 +1060,7 @@ class Rater(Algorithm):
             payload["attrs"],
         )
 
+    @_preserve_rng()
     @torch.no_grad()
     def _extract_embedding_dataset(self, split, cache_dir=None):
         """
@@ -1064,7 +1099,10 @@ class Rater(Algorithm):
             f"{self.config.backbone}..."
         )
 
-        loader = self.dataloaders[split]
+        # Cache order must be stable for per-sample trajectories and Grad-CAM IDs.
+        loader = DataLoader(self.datasets[split], batch_size=self.config.batch_size,
+                            shuffle=False, num_workers=self.config.num_workers)
+        self.feature_model.to(self.device)
         self.feature_model.eval()
 
         embeddings = []
@@ -1206,13 +1244,6 @@ class Rater(Algorithm):
             num_classes=self.n_classes,
         ).to(self.device)
 
-    def _new_final_classifier(self):
-        # Kept only for API compatibility; this meta-only experiment never
-        # trains a final classifier.
-        return InnerLinearClassifier(
-            input_dim=self.feature_dim,
-            num_classes=self.n_classes,
-        ).to(self.device)
 
     def _initialize_inner_population(self):
         if self.num_inner_models != 2:
@@ -1859,6 +1890,8 @@ class Rater(Algorithm):
                 }
             )
 
+        if any(p.grad is not None and not torch.isfinite(p.grad).all() for p in self.rater.parameters()):
+            raise RuntimeError("Nonfinite rater gradient; checkpoint update aborted.")
         if self.grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(
                 self.rater.parameters(),
@@ -1897,6 +1930,7 @@ class Rater(Algorithm):
     # Evaluation helpers
     # ========================================================
 
+    @_preserve_rng()
     @torch.no_grad()
     def _evaluate_classifier(self, model, dataset):
         """
@@ -1921,6 +1955,7 @@ class Rater(Algorithm):
         total_examples = 0
         group_correct = {}
         group_total = {}
+        group_loss_sum = {}
 
         for z, y, g, _ in loader:
             z = z.to(self.device, non_blocking=True)
@@ -1931,11 +1966,11 @@ class Rater(Algorithm):
             loss = F.cross_entropy(
                 logits,
                 y,
-                reduction="sum",
+                reduction="none",
             )
             pred = logits.argmax(dim=1)
 
-            total_loss += loss.item()
+            total_loss += loss.sum().item()
             total_correct += (pred == y).sum().item()
             total_examples += y.numel()
 
@@ -1950,6 +1985,7 @@ class Rater(Algorithm):
                     group_total.get(gid, 0)
                     + mask.sum().item()
                 )
+                group_loss_sum[gid] = group_loss_sum.get(gid, 0.0) + loss[mask].sum().item()
 
         if total_examples == 0:
             raise RuntimeError("Cannot evaluate an empty dataset.")
@@ -1959,11 +1995,17 @@ class Rater(Algorithm):
             for gid in sorted(group_total)
             if group_total[gid] > 0
         }
+        group_loss = {gid: group_loss_sum[gid] / group_total[gid]
+                      for gid in sorted(group_total)}
 
         return {
             "loss": total_loss / total_examples,
             "accuracy": total_correct / total_examples,
             "group_accuracy": group_accuracy,
+            "group_loss": group_loss,
+            "group_count": group_total,
+            "n_samples": total_examples,
+            "worst_group_loss": max(group_loss.values()),
             "worst_group_accuracy": min(group_accuracy.values())
             if group_accuracy else float("nan"),
         }
@@ -2012,12 +2054,14 @@ class Rater(Algorithm):
         return {
             "models": metrics,
             "mean_loss": mean_loss,
+            "mean_worst_group_loss": float(np.mean([m["worst_group_loss"] for m in metrics])),
             "mean_accuracy": mean_acc,
             "mean_wga": mean_wga,
             "best_accuracy": best_acc,
             "best_wga": best_wga,
         }
 
+    @_preserve_rng()
     @torch.no_grad()
     def _score_loss_relationship(self, dataset, models=None):
         """
@@ -2516,7 +2560,7 @@ class Rater(Algorithm):
         """
         Save group-colored scatter of FINAL SCORE vs classifier loss.
 
-        FINAL SCORE means the effective EA-GATED Rater weight:
+        FINAL SCORE means the effective all-sample Rater weight:
         every sample -> Rater weight.
         """
 
@@ -2640,112 +2684,166 @@ class Rater(Algorithm):
             tag_prefix=tag_prefix,
         )
 
-    @torch.no_grad()
-    def _classifier_score_loss_relationship(self, dataset, model):
-        """Raw score and effective EA-style weight vs loss for one model."""
+    def _start_artifacts(self, output_dir, split_names, datasets):
+        """Keep diagnostic data inside the directory copied by the training notebook."""
+        data_dir = _diagnostic_path(output_dir)
+        os.makedirs(data_dir, exist_ok=True)
+        if os.path.exists(os.path.join(data_dir, "metrics.csv")):
+            raise ValueError(f"Use a fresh output directory; metrics already exist in {data_dir}")
+        self._run_started = time.monotonic()
+        self._metric_rows = []
+        self._group_rows = []
+        self._run_metadata = {
+            "schema_version": 2, "seed": int(self.config.seed),
+            "config": vars(self.config),
+            "versions": {"torch": str(torch.__version__), "numpy": np.__version__,
+                         "matplotlib": matplotlib.__version__},
+            "splits": split_names,
+            "split_sizes": {k: len(v) for k, v in datasets.items()},
+            "settings": {
+                "dataset": self.config.dataset, "backbone": self.config.backbone,
+                "resolution": getattr(self.config, "resolution", 224),
+                "split_train": getattr(self.config, "split_train", 1.0),
+                "split_val": getattr(self.config, "split_val", 1.0),
+                "num_classes": self.n_classes,
+                "erm_fingerprint": self.erm_checkpoint_fingerprint,
+                "feature_dim": self.feature_dim, "batch_size": self.config.batch_size,
+                "meta_steps": self.meta_steps, "num_inner_models": self.num_inner_models,
+                "inner_lr": self.inner_lr, "outer_lr": self.outer_lr,
+                "inner_reg_weight": self.inner_reg_weight, "grad_clip": self.grad_clip,
+                "capacity": self.rater_capacity, "weighting": self.weighting,
+                "temperature": self.temperature, "outer_loss": self.outer_loss_type,
+                "outer_top_loss_percent": self.outer_top_loss_percent,
+                "outer_lse_beta": self.outer_lse_beta,
+                "calibration_size": len(datasets["val"]),
+                "inner_initialization": "independent_random_linear",
+            },
+            "metric_definition": {
+                "accuracy": "fraction correct",
+                "worst_group_accuracy": "minimum accuracy over observed groups",
+                "loss": "unweighted sample-mean cross entropy",
+                "worst_group_loss": "maximum mean cross entropy over observed groups",
+                "diagnostic_weights": "eval-mode rater, fixed ordered batches; batch-relative",
+                "sample_index": "row in the original deterministic split/cache",
+                "val": "outer calibration split used for the meta objective",
+                "heldout_val": "reserved validation subset, diagnostic-only when available",
+                "test_usage": "diagnostics only; never checkpoint selection",
+            },
+        }
+        _write_json(os.path.join(data_dir, "run_config.json"), self._run_metadata)
+        self._gradcam_sample_indices = {
+            split_names[role]: dataset.sample_indices.numpy() for role, dataset in datasets.items()
+        }
+        self.meta_log_path = os.path.join(output_dir, "log.txt")
+        self._meta_log("Rater meta-learning diagnostics")
+        for role, dataset in datasets.items():
+            _write_json(os.path.join(data_dir, "sample_indices", f"{role}.json"),
+                        {"split": split_names[role], "indices": dataset.sample_indices})
 
-        loader = DataLoader(
-            dataset,
-            batch_size=self.config.batch_size,
-            shuffle=False,
-            num_workers=self.config.num_workers,
-            pin_memory=True,
+    def _record_metrics(self, output_dir, step, model_name, split_name,
+                        role, metrics, phase="trajectory"):
+        row = {
+            "seed": int(self.config.seed), "stage": "meta", "phase": phase,
+            "step": int(step), "elapsed_seconds": time.monotonic() - self._run_started,
+            "model": model_name, "split": split_name, "role": role,
+            "n_samples": metrics["n_samples"],
+            **{key: metrics[key] for key in METRIC_FIELDS},
+        }
+        self._metric_rows.append(row)
+        _append_csv(_diagnostic_path(output_dir, "metrics.csv"), [row])
+        group_rows = [
+            {**{k: row[k] for k in ("seed", "stage", "phase", "step", "model", "split", "role")},
+             "group": gid, "n_samples": count,
+             "accuracy": metrics["group_accuracy"][gid],
+             "loss": metrics["group_loss"][gid]}
+            for gid, count in sorted(metrics["group_count"].items())
+        ]
+        _append_csv(_diagnostic_path(output_dir, "group_metrics.csv"), group_rows)
+        self._meta_log(
+            f"[meta {phase} {step:04d}] {model_name} {role}={split_name}: "
+            + ", ".join(f"{k}={metrics[k]:.6f}" for k in METRIC_FIELDS)
         )
 
-        self.rater.eval()
-        model.eval()
+    def _evaluate_inner_diagnostics(self, output_dir, step, datasets, split_names,
+                                    phase="trajectory"):
+        results = {}
+        with _preserve_rng():
+            for i, model in enumerate(self.inner_models):
+                name = f"inner_{i}"
+                results[name] = {}
+                for role, dataset in datasets.items():
+                    result = self._evaluate_classifier(model, dataset)
+                    results[name][role] = result
+                    self._record_metrics(output_dir, step, name, split_names[role], role, result, phase)
+        return results
 
-        all_scores = []
-        all_final_scores = []
-        all_losses = []
-        all_correct = []
-        all_groups = []
-        all_labels = []
-        all_attrs = []
+    def _save_metric_curves(self, output_dir):
+        plot_dir = os.path.join(output_dir, "plots", "meta_metrics")
+        os.makedirs(plot_dir, exist_ok=True)
+        rows = [r for r in self._metric_rows if r["phase"] == "trajectory"]
+        for name in sorted({r["model"] for r in rows}):
+            fig = _metric_figure([r for r in rows if r["model"] == name],
+                                 f"Meta training: {name}", "Meta step")
+            fig.savefig(os.path.join(plot_dir, f"{name}.png"), dpi=160)
+            plt.close(fig)
 
-        for z, y, g, a in loader:
-            z = z.to(self.device, non_blocking=True)
-            y_device = y.to(self.device, non_blocking=True)
+    def _score_snapshot(self, output_dir, step, role, split_name, dataset, phase="trajectory"):
+        """Reuse the existing histogram/scatter/box/ECDF plots; save their inputs once."""
+        relationship = self._score_loss_relationship(dataset)
+        prefix = "meta_step" if phase == "trajectory" else "FINAL_BEST_RATER"
+        self._save_all_score_diagnostics(relationship, output_dir, step, split_name, prefix)
+        self._save_meta_rate_box_ecdf(relationship, output_dir,
+                                     f"{prefix}_{step:06d}", split_name)
+        data_dir = _diagnostic_path(output_dir, "score_snapshots")
+        os.makedirs(data_dir, exist_ok=True)
+        arrays = {k: v for k, v in relationship.items() if isinstance(v, np.ndarray)}
+        arrays.update(sample_indices=dataset.sample_indices.numpy(),
+                      batch_indices=np.arange(len(dataset)) // self.config.batch_size)
+        np.savez_compressed(os.path.join(data_dir, f"{phase}_{step:06d}_{split_name}.npz"), **arrays)
+        correlations = {k: v for k, v in relationship.items()
+                        if k.startswith(("spearman", "pearson"))}
+        _append_csv(_diagnostic_path(output_dir, "score_correlations.csv"), [
+            {"seed": self.config.seed, "stage": "meta", "phase": phase, "step": step,
+             "split": split_name, "role": role, **correlations}
+        ])
+        groups, weights = relationship["groups"], relationship["final_scores"]
+        rows = []
+        for gid in sorted(np.unique(groups)):
+            mask = groups == gid
+            w, raw = weights[mask], relationship["scores"][mask]
+            rows.append({
+                "seed": self.config.seed, "stage": "meta", "phase": phase,
+                "step": step, "split": split_name, "role": role, "group": int(gid),
+                "n_samples": int(mask.sum()), "raw_mean": float(raw.mean()),
+                "raw_std": float(raw.std()), "weight_mean": float(w.mean()),
+                "weight_std": float(w.std()), "weight_q25": float(np.quantile(w, .25)),
+                "weight_median": float(np.median(w)), "weight_q75": float(np.quantile(w, .75)),
+                "weight_mass_share": float(w.sum() / max(float(weights.sum()), 1e-12)),
+            })
+        self._group_rows.extend(rows)
+        _append_csv(_diagnostic_path(output_dir, "group_statistics.csv"), rows)
+        return relationship
 
-            raw_scores = self.rater(z)
-            logits = model(z)
-
-            effective_weights, correct_mask, _ = (
-                self._all_sample_training_weights(
-                    z=z,
-                    y=y_device,
-                    logits=logits,
-                    raw_scores_all=raw_scores,
-                )
-            )
-
-            losses = F.cross_entropy(
-                logits,
-                y_device,
-                reduction="none",
-            )
-
-            all_scores.append(raw_scores.cpu())
-            all_final_scores.append(effective_weights.cpu())
-            all_losses.append(losses.cpu())
-            all_correct.append(correct_mask.float().cpu())
-            all_groups.append(g.cpu())
-            all_labels.append(y.cpu())
-            all_attrs.append(a.cpu())
-
-        scores = torch.cat(all_scores).numpy()
-        final_scores = torch.cat(all_final_scores).numpy()
-        losses = torch.cat(all_losses).numpy()
-        correctness = torch.cat(all_correct).numpy()
-        groups = torch.cat(all_groups).numpy()
-        labels = torch.cat(all_labels).numpy()
-        attrs = torch.cat(all_attrs).numpy()
-
-        def _corr(x, y):
-            if len(x) >= 2 and np.std(x) > 0 and np.std(y) > 0:
-                return (
-                    float(stats.spearmanr(x, y).statistic),
-                    float(stats.pearsonr(x, y).statistic),
-                )
-            return 0.0, 0.0
-
-        spearman_loss, pearson_loss = _corr(scores, losses)
-        spearman_final_loss, pearson_final_loss = _corr(final_scores, losses)
-
-        if len(scores) >= 2 and np.std(scores) > 0 and np.std(correctness) > 0:
-            spearman_correct = float(stats.spearmanr(scores, correctness).statistic)
-        else:
-            spearman_correct = 0.0
-
-        if len(final_scores) >= 2 and np.std(final_scores) > 0 and np.std(correctness) > 0:
-            spearman_final_correct = float(
-                stats.spearmanr(final_scores, correctness).statistic
-            )
-        else:
-            spearman_final_correct = 0.0
-
+    def _checkpoint_payload(self, step):
         return {
-            "scores": scores,
-            "final_scores": final_scores,
-            "training_weights": final_scores,
-            "mean_loss": losses,
-            "mean_correctness": correctness,
-            "groups": groups,
-            "labels": labels,
-            "attrs": attrs,
-            "spearman_score_vs_loss": spearman_loss,
-            "pearson_score_vs_loss": pearson_loss,
-            "spearman_score_vs_correctness": spearman_correct,
-            "spearman_final_score_vs_loss": spearman_final_loss,
-            "pearson_final_score_vs_loss": pearson_final_loss,
-            "spearman_final_score_vs_correctness": spearman_final_correct,
+            "schema_version": 2, "stage": "meta", "step": step,
+            "rater_sd": _cpu_state(self.rater),
+            "inner_model_sds": [_cpu_state(m) for m in self.inner_models],
+            "outer_optimizer_sd": copy.deepcopy(self.outer_optimizer.state_dict()),
+            "rng_state": _rng_state(), "run_metadata": self._run_metadata,
+            "feature_dim": self.feature_dim, "num_classes": self.n_classes,
+            "erm_model_path": self.erm_model_path,
+            "erm_checkpoint_fingerprint": self.erm_checkpoint_fingerprint,
+            "rater_capacity": self.rater_capacity, "rater_weighting": self.weighting,
+            "rater_temperature": self.temperature,
         }
 
+    @_preserve_rng()
     @torch.no_grad()
     def _compute_scores(self, dataset, model=None):
         """
         Save raw Rater scores and, when a classifier is supplied, the
-        effective EA-GATED Rater weights for that classifier.
+        effective all-sample Rater weights for that classifier.
         """
 
         loader = DataLoader(
@@ -2859,66 +2957,6 @@ class Rater(Algorithm):
     # Checkpoints
     # ========================================================
 
-    def _save_rater_checkpoint(
-        self,
-        path,
-        meta_step,
-        meta_loss,
-        outer_ce=None,
-        grad_mse=None,
-    ):
-        torch.save(
-            {
-                "rater_sd": self.rater.state_dict(),
-                "outer_optimizer_sd": (
-                    self.outer_optimizer.state_dict()
-                ),
-                "meta_step": meta_step,
-                "meta_loss": meta_loss,
-
-                # Backward-compatible key.
-                "outer_loss": meta_loss,
-
-                "outer_ce": outer_ce,
-                "grad_mse": 0.0,
-                "lambda_g": 0.0,
-                "meta_objective": (
-                    "outer_classification_cross_entropy_only"
-                ),
-                "rate_all_samples": True,
-                "inner_initialization": (
-                    "erm_head_exact_for_model0_"
-                    "plus_small_noise_for_models1plus"
-                ),
-                "num_inner_models": self.num_inner_models,
-                "inner_init_noise_std": (
-                    self.inner_init_noise_std
-                ),
-                "erm_model_path": self.erm_model_path,
-                "erm_checkpoint_fingerprint": (
-                    self.erm_checkpoint_fingerprint
-                ),
-                "erm_checkpoint_epoch": (
-                    self.erm_checkpoint_epoch
-                ),
-
-                "feature_dim": self.feature_dim,
-                "backbone": self.config.backbone,
-                "pretrained": True,
-                "rater_capacity": self.rater_capacity,
-                "rater_weighting": self.weighting,
-                "rater_temperature": self.temperature,
-
-                "embedding_cache_root": (
-                    self.embedding_cache_root
-                ),
-                "embedding_cache_namespace": (
-                    self._embedding_cache_namespace()
-                ),
-            },
-            path,
-        )
-
     def _load_rater_checkpoint(self, path):
         if not os.path.exists(path):
             raise ValueError(f"Rater checkpoint does not exist: {path}")
@@ -2928,6 +2966,7 @@ class Rater(Algorithm):
             map_location="cpu",
             weights_only=False,
         )
+        self._validate_checkpoint_representation(checkpoint)
 
         if "rater_sd" in checkpoint:
             self.rater.load_state_dict(checkpoint["rater_sd"])
@@ -2935,61 +2974,14 @@ class Rater(Algorithm):
             # Also permit loading a raw rater state_dict.
             self.rater.load_state_dict(checkpoint)
 
-        log(f"[Rater] Loaded checkpoint from {path}")
+        log(f"[Rater] Loaded rater weights from {path} (warm start, not a resumed optimizer run)")
 
-    def _save_population_snapshot(self, output_dir, meta_step):
-        """Save raw state_dict snapshots for post-hoc evaluation."""
-
-        rater_dir = os.path.join(output_dir, "rater_checkpoints")
-        model_dir = os.path.join(output_dir, "models")
-        os.makedirs(rater_dir, exist_ok=True)
-        os.makedirs(model_dir, exist_ok=True)
-
-        torch.save(
-            self.rater.state_dict(),
-            os.path.join(
-                rater_dir,
-                f"data_rater_{meta_step:06d}.pt",
-            ),
-        )
-
-        for i, model in enumerate(self.inner_models):
-            torch.save(
-                model.state_dict(),
-                os.path.join(
-                    model_dir,
-                    f"inner_model{i}_{meta_step:06d}.pt",
-                ),
-            )
-
-    def _save_final_classifier(self, path, model):
-        torch.save(
-            {
-                "model_sd": model.state_dict(),
-                "feature_dim": self.feature_dim,
-                "num_classes": self.n_classes,
-            },
-            path,
-        )
-
-    def _load_final_classifier(self, path):
-        checkpoint = torch.load(
-            path,
-            map_location="cpu",
-            weights_only=False,
-        )
-        model = self._new_final_classifier()
-        if "model_sd" in checkpoint:
-            model.load_state_dict(checkpoint["model_sd"])
-        else:
-            model.load_state_dict(checkpoint)
-        model.to(self.device)
-        model.eval()
-        return model
-
-    # ========================================================
-    # Split handling
-    # ========================================================
+    def _validate_checkpoint_representation(self, checkpoint):
+        fingerprint = checkpoint.get("erm_checkpoint_fingerprint", checkpoint.get("erm_fingerprint"))
+        if fingerprint is not None and fingerprint != self.erm_checkpoint_fingerprint:
+            raise ValueError("Checkpoint was trained on a different frozen ERM representation.")
+        if checkpoint.get("feature_dim", self.feature_dim) != self.feature_dim:
+            raise ValueError("Checkpoint feature dimension does not match the backbone.")
 
     def _has_ea_calibration_split(self):
         """
@@ -3016,7 +3008,7 @@ class Rater(Algorithm):
             inner/meta-train = train_no_aug
             outer/meta-val   = val_subset1
 
-        This reserves val_subset2 for final-classifier model selection.
+        The reserved val_subset2 remains diagnostic-only during meta-training.
 
         Legacy mode (--split_val == 1):
             inner/meta-train = train_no_aug
@@ -3027,7 +3019,7 @@ class Rater(Algorithm):
             inner_split = "train_no_aug"
 
             if (
-                self.use_calibration_final
+                self.use_calibration_split
                 and self._has_ea_calibration_split()
             ):
                 return inner_split, "val_subset1"
@@ -3041,7 +3033,7 @@ class Rater(Algorithm):
                 inner_split = split
 
             if (
-                self.use_calibration_final
+                self.use_calibration_split
                 and self._has_ea_calibration_split()
             ):
                 return inner_split, "val_subset1"
@@ -3058,646 +3050,123 @@ class Rater(Algorithm):
 
         return split, "val"
 
-    def _resolve_final_classifier_splits(self):
-        """
-        Final classifier protocol.
-
-        EA-style:
-            calibration / classifier training = val_subset1
-            checkpoint selection              = val_subset2
-            final reporting                   = test
-        """
-        if self.use_calibration_final:
-            if not self._has_ea_calibration_split():
-                raise ValueError(
-                    "EA-style final-classifier calibration is enabled, "
-                    "but val_subset1/val_subset2 do not exist. "
-                    "Run with --split_val 0.4 (the EA repository example) "
-                    "or another value < 1."
-                )
-
-            return "val_subset1", "val_subset2"
-
-        return "train_no_aug", "val"
 
     # ========================================================
-    # Final-classifier epoch diagnostics
+    # Image-space diagnostics for the rater and inner models
     # ========================================================
 
-    def _save_final_epoch_weight_histograms(
-        self,
-        output_dir,
-        epoch,
-        weights,
-        groups,
-        correctness,
-        split_name="train",
-    ):
+
+    def _save_gradcam(self, output_dir, tag, splits, heads, samples_per_group=1):
+        """Image-space Grad-CAM through the frozen backbone and embedding heads.
+
+        Rater target: raw scalar score. Classifier target: predicted-class logit.
+        CPU execution keeps the backbone out of GPU memory during meta unrolling.
         """
-        Save ACTUAL EA-GATED Rater weights used during one
-        final-classifier epoch.
-
-        Correctness is diagnostic only; it does not gate the weights.
-        """
-        weights = np.asarray(
-            weights,
-            dtype=np.float64,
-        )
-
-        groups = np.asarray(
-            groups,
-            dtype=np.int64,
-        )
-
-        correctness = np.asarray(
-            correctness,
-            dtype=np.float64,
-        )
-
-        if len(weights) == 0:
+        if samples_per_group == 0:
             return
-
-        data_dir = os.path.join(
-            output_dir,
-            "plots",
-            "final_classifier_epoch_weight_data",
-        )
-
-        os.makedirs(
-            data_dir,
-            exist_ok=True,
-        )
-
-        csv_path = os.path.join(
-            data_dir,
-            f"epoch_{epoch:03d}_{split_name}_weights.csv",
-        )
-
-        with open(
-            csv_path,
-            "w",
-            newline="",
-        ) as f:
-            writer = csv.writer(f)
-
-            writer.writerow(
-                [
-                    "index",
-                    "all_sample_rater_weight",
-                    "group",
-                    "correct_before_update",
-                ]
-            )
-
-            for i in range(
-                len(weights)
-            ):
-                writer.writerow(
-                    [
-                        i,
-                        float(weights[i]),
-                        int(groups[i]),
-                        int(correctness[i] >= 0.5),
-                    ]
-                )
-
-        plot_dir = os.path.join(
-            output_dir,
-            "plots",
-            "final_classifier_epoch_all_sample_weight_histogram",
-        )
-
-        os.makedirs(
-            plot_dir,
-            exist_ok=True,
-        )
-
-        finite = weights[
-            np.isfinite(weights)
-        ]
-
-        if len(finite) == 0:
+        plot_dir = os.path.join(output_dir, "plots", "gradcam", tag)
+        os.makedirs(plot_dir, exist_ok=True)
+        if self.feature_model is None:
+            _write_json(os.path.join(plot_dir, "status.json"),
+                        {"status": "skipped", "reason": "Image backbone unavailable."})
             return
-
-        wmin = float(
-            finite.min()
-        )
-
-        wmax = float(
-            finite.max()
-        )
-
-        if np.isclose(
-            wmin,
-            wmax,
-        ):
-            eps = max(
-                abs(wmin) * 0.05,
-                1e-6,
-            )
-
-            bins = np.linspace(
-                wmin - eps,
-                wmax + eps,
-                30,
-            )
-        else:
-            bins = np.linspace(
-                wmin,
-                wmax,
-                41,
-            )
-
-        fig, ax = plt.subplots(
-            figsize=(10, 7)
-        )
-
-        for gid in sorted(
-            np.unique(groups)
-        ):
-            mask = groups == gid
-
-            if not np.any(mask):
-                continue
-
-            ax.hist(
-                weights[mask],
-                bins=bins,
-                density=True,
-                alpha=0.45,
-                label=(
-                    f"{self._group_display_name(gid)} "
-                    f"(n={int(mask.sum())})"
-                ),
-            )
-
-        ax.set_xlabel(
-            f"EA-GATED trained-Rater {self.weighting} weight"
-        )
-
-        ax.set_ylabel(
-            "Density"
-        )
-
-        ax.set_title(
-            f"Final-classifier EA-GATED training weights by group | "
-            f"epoch {epoch}\\n"
-            f"correct before update="
-            f"{100.0 * correctness.mean():.2f}%"
-        )
-
-        ax.grid(
-            True,
-            linestyle=":",
-            alpha=0.30,
-        )
-
-        ax.legend(
-            loc="best",
-            fontsize=9,
-        )
-
-        fig.tight_layout()
-
-        plot_path = os.path.join(
-            plot_dir,
-            f"epoch_{epoch:03d}_{split_name}_all_sample_weight_hist.png",
-        )
-
-        fig.savefig(
-            plot_path,
-            dpi=160,
-            bbox_inches="tight",
-        )
-
-        plt.close(fig)
-
-        summary_parts = []
-
-        for gid in sorted(
-            np.unique(groups)
-        ):
-            mask = groups == gid
-
-            summary_parts.append(
-                f"g{int(gid)}: "
-                f"mean_w={weights[mask].mean():.3f}, "
-                f"std_w={weights[mask].std():.3f}, "
-                f"acc_before_update="
-                f"{100.0 * correctness[mask].mean():.1f}%"
-            )
-
-        log(
-            f"[Final classifier epoch {epoch:03d} EA-GATED weights] "
-            + "; ".join(summary_parts)
-        )
-
-        log(
-            f"[Final classifier plot] saved EA-GATED weight histogram: "
-            f"{plot_path}"
-        )
-
-    # ========================================================
-    # Final weighted classifier
-    # ========================================================
-
-    def _selection_value(self, metrics):
-        if self.final_selection == "accuracy":
-            return metrics["accuracy"]
-        if self.final_selection == "wga":
-            return metrics["worst_group_accuracy"]
-        # Lower loss is better, so negate it to retain max-selection logic.
-        return -metrics["loss"]
-
-    def _train_final_classifier(
-        self,
-        calibration_dataset,
-        selection_dataset,
-        test_dataset,
-        output_dir,
-        calibration_split="train_no_aug",
-        selection_split="val",
-        test_split="test",
-    ):
-        """
-        Train a fresh linear classifier with the trained Rater frozen.
-
-        EVERY calibration sample receives a Rater-derived weight:
-
-            raw_i = frozen_Rater(z_i)
-            w_i   = selected transform(raw_i)
-
-            L = sum_i w_i * CE_i
-
-        There is NO correct/misclassified gate and NO division by
-        sum(weights).
-        """
-        log(
-            "[Rater] Training fresh final classifier with "
-            "FROZEN trained Rater and EA-GATED weighting..."
-        )
-
-        log(
-            f"[Final classifier] calibration/train = "
-            f"{calibration_split} "
-            f"({len(calibration_dataset)} samples)"
-        )
-
-        log(
-            f"[Final classifier] selection = "
-            f"{selection_split} "
-            f"({len(selection_dataset)} samples)"
-        )
-
-        log(
-            f"[Final classifier] test diagnostic = "
-            f"{test_split} "
-            f"({len(test_dataset)} samples)"
-        )
-
-        log(
-            f"[Final classifier] selection metric = "
-            f"{self.final_selection}"
-        )
-
-        log(
-            "[Final classifier] EVERY sample uses a frozen-Rater weight."
-        )
-
-        self.rater.eval()
-
-        for p in self.rater.parameters():
-            p.requires_grad_(False)
-
-        model = self._new_final_classifier()
-
-        optimizer = torch.optim.SGD(
-            model.parameters(),
-            lr=self.final_lr,
-            momentum=self.final_momentum,
-            weight_decay=self.final_weight_decay,
-        )
-
-        train_loader = DataLoader(
-            calibration_dataset,
-            batch_size=self.config.batch_size,
-            shuffle=True,
-            num_workers=self.config.num_workers,
-            pin_memory=True,
-        )
-
-        best_value = -float("inf")
-        best_state = None
-        best_epoch = None
-        best_metrics = None
-
-        history = []
-
-        for epoch in range(
-            1,
-            self.final_epochs + 1,
-        ):
-            model.train()
-
-            running_weighted_loss = 0.0
-            total_correct = 0
-            total_examples = 0
-            num_batches = 0
-
-            epoch_weights = []
-            epoch_groups = []
-            epoch_correctness = []
-
-            for z, y, g, _ in train_loader:
-                z = z.to(
-                    self.device,
-                    non_blocking=True,
-                )
-
-                y = y.to(
-                    self.device,
-                    non_blocking=True,
-                )
-
-                g = torch.as_tensor(
-                    g
-                ).to(
-                    self.device,
-                    non_blocking=True,
-                )
-
-                logits = model(z)
-
-                with torch.no_grad():
-                    raw_scores = self.rater(z)
-
-                    weights = self._scores_to_weights(
-                        raw_scores
-                    )
-
-                    correct_mask = (
-                        logits.argmax(dim=1).eq(y)
-                    )
-
-                epoch_weights.append(
-                    weights.detach().cpu()
-                )
-
-                epoch_groups.append(
-                    g.detach().cpu()
-                )
-
-                epoch_correctness.append(
-                    correct_mask.float()
-                    .detach()
-                    .cpu()
-                )
-
-                per_sample_loss = F.cross_entropy(
-                    logits,
-                    y,
-                    reduction="none",
-                )
-
-                weighted_loss = (
-                    per_sample_loss
-                    * weights
-                ).sum()
-
-                optimizer.zero_grad()
-
-                weighted_loss.backward()
-
-                optimizer.step()
-
-                running_weighted_loss += float(
-                    weighted_loss.item()
-                )
-
-                total_correct += int(
-                    correct_mask.sum().item()
-                )
-
-                total_examples += int(
-                    y.numel()
-                )
-
-                num_batches += 1
-
-            train_acc = (
-                total_correct
-                / max(total_examples, 1)
-            )
-
-            train_weighted_loss = (
-                running_weighted_loss
-                / max(num_batches, 1)
-            )
-
-            epoch_weights_np = torch.cat(
-                epoch_weights
-            ).numpy()
-
-            epoch_groups_np = torch.cat(
-                epoch_groups
-            ).numpy()
-
-            epoch_correctness_np = torch.cat(
-                epoch_correctness
-            ).numpy()
-
-            should_plot_final = (
-                epoch == 1
-                or epoch % self.final_plot_freq == 0
-                or epoch == self.final_epochs
-            )
-
-            if should_plot_final:
-                self._save_final_epoch_weight_histograms(
-                    output_dir=output_dir,
-                    epoch=epoch,
-                    weights=epoch_weights_np,
-                    groups=epoch_groups_np,
-                    correctness=epoch_correctness_np,
-                    split_name=calibration_split,
-                )
-
-            selection_metrics = (
-                self._evaluate_classifier(
-                    model,
-                    selection_dataset,
-                )
-            )
-
-            selection_value = (
-                self._selection_value(
-                    selection_metrics
-                )
-            )
-
-            test_metrics = (
-                self._evaluate_classifier(
-                    model,
-                    test_dataset,
-                )
-            )
-
-            history.append(
-                [
-                    epoch,
-                    train_weighted_loss,
-                    train_acc,
-                    selection_metrics["loss"],
-                    selection_metrics["accuracy"],
-                    selection_metrics["worst_group_accuracy"],
-                    test_metrics["loss"],
-                    test_metrics["accuracy"],
-                    test_metrics["worst_group_accuracy"],
-                    float(epoch_weights_np.mean()),
-                    float(epoch_weights_np.std()),
-                ]
-            )
-
-            log(
-                f"[Final classifier epoch {epoch:03d}] "
-                f"weighted_train_loss={train_weighted_loss:.6f}, "
-                f"train_acc={100.0 * train_acc:.2f}%, "
-                f"mean_all_sample_weight={epoch_weights_np.mean():.4f}, "
-                f"selection_acc="
-                f"{100.0 * selection_metrics['accuracy']:.2f}%, "
-                f"selection_WGA="
-                f"{100.0 * selection_metrics['worst_group_accuracy']:.2f}%, "
-                f"test_acc={100.0 * test_metrics['accuracy']:.2f}%, "
-                f"test_WGA="
-                f"{100.0 * test_metrics['worst_group_accuracy']:.2f}%"
-            )
-
-            if selection_value > best_value:
-                best_value = selection_value
-                best_epoch = epoch
-
-                best_metrics = {
-                    "loss": float(
-                        selection_metrics["loss"]
-                    ),
-                    "accuracy": float(
-                        selection_metrics["accuracy"]
-                    ),
-                    "worst_group_accuracy": float(
-                        selection_metrics[
-                            "worst_group_accuracy"
-                        ]
-                    ),
-                    "group_accuracy": {
-                        int(k): float(v)
-                        for k, v
-                        in selection_metrics[
-                            "group_accuracy"
-                        ].items()
-                    },
-                }
-
-                best_state = {
-                    k: v.detach().cpu().clone()
-                    for k, v
-                    in model.state_dict().items()
-                }
-
-                torch.save(
-                    {
-                        "model_sd": best_state,
-                        "epoch": best_epoch,
-                        "selection_metric": self.final_selection,
-                        "selection_value": float(best_value),
-                        "selection_metrics": best_metrics,
-                        "all_sample_rater_weighting": True,
-                    },
-                    os.path.join(
-                        output_dir,
-                        "best_final_weighted_classifier.pt",
-                    ),
-                )
-
-        if best_state is None:
-            raise RuntimeError(
-                "Final classifier training produced no model."
-            )
-
-        model.load_state_dict(
-            best_state
-        )
-
-        model.to(
-            self.device
-        )
-
-        model.eval()
-
-        history_path = os.path.join(
-            output_dir,
-            "final_classifier_history.csv",
-        )
-
-        with open(
-            history_path,
-            "w",
-            newline="",
-        ) as f:
-            writer = csv.writer(f)
-
-            writer.writerow(
-                [
-                    "epoch",
-                    "weighted_train_loss",
-                    "train_accuracy",
-                    "selection_loss",
-                    "selection_accuracy",
-                    "selection_wga",
-                    "test_loss",
-                    "test_accuracy",
-                    "test_wga",
-                    "mean_all_sample_weight",
-                    "std_all_sample_weight",
-                ]
-            )
-
-            writer.writerows(
-                history
-            )
-
-        log(
-            f"[Final classifier] Restored selected epoch "
-            f"{best_epoch:03d}."
-        )
-
-        self.rater.eval()
-
-        return model
-
-
-    # ========================================================
-    # Meta-only experiment helpers
-    # ========================================================
+        backbone = self.feature_model.backbone
+        layer = getattr(backbone, "layer4", None)
+        if layer is None:
+            _write_json(os.path.join(plot_dir, "status.json"),
+                        {"status": "skipped", "reason": "Backbone has no spatial layer4."})
+            return
+        previous_device = next(backbone.parameters()).device
+        previous_mode = backbone.training
+        backbone.cpu().eval()
+        cpu_heads = {name: copy.deepcopy(head).cpu().eval() for name, head in heads.items()}
+        activations = []
+        hook = layer.register_forward_hook(lambda module, args, output: activations.append(output))
+        rows = []
+        try:
+            with _preserve_rng(), torch.enable_grad():
+                for split_name in dict.fromkeys(splits):
+                    dataset = self.datasets.get(split_name)
+                    if dataset is None or not hasattr(dataset, "group_array"):
+                        rows.append({"split": split_name, "status": "skipped: no image/group metadata"})
+                        continue
+                    groups = np.asarray(dataset.group_array)
+                    eligible = getattr(self, "_gradcam_sample_indices", {}).get(
+                        split_name, np.arange(len(dataset)))
+                    indexes = [int(i) for gid in sorted(np.unique(groups[eligible]))
+                               for i in eligible[groups[eligible] == gid][:samples_per_group]]
+                    for index in indexes:
+                        x, y, group, _ = dataset[index]
+                        if not torch.is_tensor(x) or x.ndim != 3 or x.shape[0] != 3:
+                            rows.append({"split": split_name, "sample_index": index,
+                                         "status": "skipped: expected RGB image tensor"})
+                            continue
+                        x = x.detach().cpu().unsqueeze(0).requires_grad_(True)
+                        activations.clear()
+                        embedding = backbone(x)
+                        activation = activations[-1]
+                        # Undo the actual dataset's Normalize transform for faithful overlays.
+                        display = x.detach()[0].clone()
+                        transforms = list(getattr(getattr(dataset, "transform", None), "transforms", []))
+                        for transform in reversed(transforms):
+                            if hasattr(transform, "mean") and hasattr(transform, "std"):
+                                display = display * torch.as_tensor(transform.std)[:, None, None]
+                                display = display + torch.as_tensor(transform.mean)[:, None, None]
+                                break
+                        display = display.clamp(0, 1).permute(1, 2, 0).numpy()
+                        fig, axes = plt.subplots(1, len(cpu_heads) + 1,
+                                                 figsize=(4 * (len(cpu_heads) + 1), 4), squeeze=False)
+                        axes[0, 0].imshow(display)
+                        axes[0, 0].set_title(f"{split_name}[{index}]\ny={int(y)}, group={int(group)}")
+                        saved = {"image": display}
+                        targets = {}
+                        for column, (name, head) in enumerate(cpu_heads.items(), 1):
+                            value = head(embedding)
+                            target_class = None if name == "rater" else int(value.argmax(dim=1).item())
+                            target = value.reshape(-1)[0] if target_class is None else value[0, target_class]
+                            gradients = torch.autograd.grad(target, activation, retain_graph=True)[0]
+                            cam = (gradients.mean(dim=(2, 3), keepdim=True) * activation).sum(dim=1)
+                            cam = F.relu(cam)
+                            cam = F.interpolate(cam[:, None], size=x.shape[-2:],
+                                                mode="bilinear", align_corners=False)[0, 0]
+                            cam = cam.detach()
+                            cam = (cam - cam.min()) / (cam.max() - cam.min()).clamp_min(1e-12)
+                            cam = cam.numpy()
+                            saved[name] = cam
+                            targets[name] = {"class": target_class, "value": float(target.detach()),
+                                             "target": "raw_score" if name == "rater" else "predicted_logit"}
+                            axes[0, column].imshow(display)
+                            axes[0, column].imshow(cam, cmap="jet", alpha=0.45, vmin=0, vmax=1)
+                            axes[0, column].set_title(name + (" (raw score)" if name == "rater"
+                                                           else f" (class {target_class})"))
+                        for ax in axes.flat:
+                            ax.axis("off")
+                        fig.tight_layout()
+                        stem = f"{split_name}_g{int(group)}_sample{index:06d}"
+                        fig.savefig(os.path.join(plot_dir, stem + ".png"), dpi=140)
+                        plt.close(fig)
+                        np.savez_compressed(os.path.join(plot_dir, stem + ".npz"), **saved)
+                        filenames = getattr(dataset, "filename_array", None)
+                        rows.append({"split": split_name, "sample_index": index,
+                                     "filename": str(filenames[index]) if filenames is not None else None,
+                                     "label": int(y), "group": int(group), "targets": targets,
+                                     "status": "saved", "artifact": stem})
+        finally:
+            hook.remove()
+            activations.clear()
+            backbone.to(previous_device).train(previous_mode)
+        _write_json(os.path.join(plot_dir, "samples.json"), rows)
 
     def _meta_log(self, message):
+        path = getattr(self, "meta_log_path", None)
+        before = os.path.getsize(path) if path and os.path.exists(path) else 0
         log(message)
-
-        path = getattr(
-            self,
-            "meta_log_path",
-            None,
-        )
-
-        if path:
-            with open(
-                path,
-                "a",
-                encoding="utf-8",
-            ) as fout:
-                fout.write(
-                    str(message)
-                    + "\n"
-                )
+        # utils.log may already write to this run's log.txt (main.py does this).
+        # Direct library use still gets a log without duplicating those entries.
+        after = os.path.getsize(path) if path and os.path.exists(path) else 0
+        if path and after == before:
+            with open(path, "a", encoding="utf-8") as fout:
+                fout.write(str(message) + "\n")
 
     def _group_name_meta(self, gid):
         names = {
@@ -3908,638 +3377,389 @@ class Rater(Algorithm):
             )
             plt.close(fig)
 
+        trajectory = [r for r in group_trajectory
+                      if r.get("phase", "trajectory") == "trajectory"]
+        if not trajectory:
+            return
+        splits = sorted({r.get("split", "outer") for r in trajectory})
         for field, ylabel, filename in [
-            (
-                "raw_mean",
-                "Mean raw Rater score",
-                "group_mean_raw_score.png",
-            ),
-            (
-                "weight_mean",
-                f"Mean {self.weighting} weight",
-                "group_mean_weight.png",
-            ),
+            ("raw_mean", "Mean raw Rater score", "group_mean_raw_score.png"),
+            ("weight_mean", f"Mean {self.weighting} weight", "group_mean_weight.png"),
         ]:
-            if not group_trajectory:
-                continue
-
-            fig, ax = plt.subplots(
-                figsize=(11, 7)
-            )
-
-            gids = sorted(
-                {
-                    int(row["group"])
-                    for row in group_trajectory
-                }
-            )
-
-            for gid in gids:
-                rows = [
-                    row
-                    for row in group_trajectory
-                    if int(row["group"]) == gid
-                ]
-                rows = sorted(
-                    rows,
-                    key=lambda row: int(row["step"]),
-                )
-
-                ax.plot(
-                    [row["step"] for row in rows],
-                    [row[field] for row in rows],
-                    marker="o",
-                    markersize=3,
-                    linewidth=1.5,
-                    label=self._group_name_meta(gid),
-                )
-
-            ax.set_xlabel("Meta step")
-            ax.set_ylabel(ylabel)
-            ax.set_title(
-                f"{ylabel} by group during meta-learning"
-            )
-            ax.grid(
-                True,
-                linestyle=":",
-                alpha=0.30,
-            )
-            ax.legend(fontsize=9)
+            columns = min(2, len(splits))
+            fig, axes = plt.subplots(math.ceil(len(splits) / columns), columns,
+                                     figsize=(7 * columns, 4 * math.ceil(len(splits) / columns)),
+                                     squeeze=False)
+            for ax, split_name in zip(axes.flat, splits):
+                split_rows = [r for r in trajectory if r.get("split", "outer") == split_name]
+                for gid in sorted({int(r["group"]) for r in split_rows}):
+                    rows = sorted((r for r in split_rows if int(r["group"]) == gid),
+                                  key=lambda r: int(r["step"]))
+                    ax.plot([r["step"] for r in rows], [r[field] for r in rows],
+                            marker="o", markersize=3, label=self._group_name_meta(gid))
+                ax.set(xlabel="Meta step", ylabel=ylabel, title=split_name)
+                ax.grid(alpha=.25)
+                ax.legend(fontsize=8)
+            for ax in list(axes.flat)[len(splits):]:
+                ax.set_visible(False)
+            fig.suptitle(f"{ylabel} by group during meta training")
             fig.tight_layout()
-            fig.savefig(
-                os.path.join(
-                    plot_dir,
-                    filename,
-                ),
-                dpi=160,
-                bbox_inches="tight",
-            )
+            fig.savefig(os.path.join(plot_dir, filename), dpi=160, bbox_inches="tight")
             plt.close(fig)
 
-    def _write_meta_summary(
-        self,
-        output_dir,
-        best_step,
-        best_outer_loss,
-        final_relationships,
-        final_metrics,
-    ):
-        lines = [
-            "RATER META-LEARNING SUMMARY",
-            "=" * 88,
-            "",
-            "Representation: frozen Waterbirds-ERM ResNet-50 embeddings",
-            f"ERM checkpoint: {self.erm_model_path}",
-            f"ERM fingerprint: {self.erm_checkpoint_fingerprint}",
-            f"Feature dimension: {self.feature_dim}",
-            "",
-            "Inner models: 2 independent random Linear(2048, 2) classifiers",
-            "Initialized from ERM classifier: NO",
-            "Reinitialized/refreshed during meta-training: NO",
-            (
-                "Before every Rater update: BOTH inner models each see "
-                "the ENTIRE train_no_aug set exactly once"
-            ),
-            "",
-            f"Meta steps: {self.meta_steps}",
-            f"Full inner steps per meta update: {self.inner_steps}",
-            f"Weighting transform for ALL samples: {self.weighting}",
-            f"Temperature: {self.temperature}",
-            "All samples receive Rater ratings regardless of correctness",
-            f"Inner LR: {self.inner_lr}",
-            f"Outer LR: {self.outer_lr}",
-            f"Gradient clip: {self.grad_clip}",
-            "Inner objective: SUM_i weight_i * CE_i",
-            "Divide by sum(weights): NO",
-            f"Rater meta objective: {self.outer_loss_type}; NO group annotations",
-            f"Outer top-loss percentage per class (if selected): {self.outer_top_loss_percent:g}%",
-            f"Outer LSE beta: {self.outer_lse_beta:g}",
-            f"Best meta step: {best_step}",
-            f"Best outer loss: {best_outer_loss:.8f}",
-            "",
-            "FINAL INNER-POPULATION METRICS",
-            "-" * 88,
-        ]
-
-        for split_name, metrics in final_metrics.items():
-            lines.append(
-                f"{split_name}: "
-                f"mean_loss={metrics['mean_loss']:.6f}, "
-                f"mean_acc={metrics['mean_accuracy']:.6f}, "
-                f"mean_WGA={metrics['mean_wga']:.6f}"
-            )
-
-        lines.extend(
-            [
-                "",
-                "FINAL RATER RATE/WEIGHT SUMMARIES",
-                "-" * 88,
-            ]
-        )
-
-        for split_name, relationship in final_relationships.items():
-            scores = np.asarray(
-                relationship["scores"]
-            )
-            weights = np.asarray(
-                relationship["final_scores"]
-            )
-            losses = np.asarray(
-                relationship["mean_loss"]
-            )
-            groups = np.asarray(
-                relationship["groups"]
-            )
-
-            lines.append(
-                f"{split_name}: n={len(scores)}, "
-                f"raw_mean={scores.mean():.6f}, "
-                f"raw_std={scores.std():.6f}, "
-                f"weight_mean={weights.mean():.6f}, "
-                f"weight_std={weights.std():.6f}"
-            )
-
-            for gid in sorted(np.unique(groups)):
-                mask = groups == gid
-                lines.append(
-                    f"  {self._group_name_meta(gid)}: "
-                    f"n={int(mask.sum())}, "
-                    f"raw_mean={scores[mask].mean():.6f}, "
-                    f"weight_mean={weights[mask].mean():.6f}, "
-                    f"loss_mean={losses[mask].mean():.6f}"
-                )
-
-        lines.extend(
-            [
-                "",
-                "Saved outputs:",
-                "  plots/",
-                "  log.txt",
-                "  summary.txt",
-                "  final_rater.pt",
-            ]
-        )
-
-        path = os.path.join(
-            output_dir,
-            "summary.txt",
-        )
-
-        with open(
-            path,
-            "w",
-            encoding="utf-8",
-        ) as fout:
-            fout.write(
-                "\n".join(lines)
-                + "\n"
-            )
-
-        return path
-
-    # ========================================================
-    # Main training -- FROZEN RATER / FINAL CLASSIFIER ONLY
-    # ========================================================
-
-    def train(
-        self,
-        output_dir,
-        split="train",
-    ):
-        """
-        Train ONLY the Rater.
-
-        No final classifier is trained here. The outer/Rater objective is the
-        configurable class-wise top-loss CE tail and never uses group labels.
-
-        Crucial full-epoch rule:
-            self.inner_steps = len(train_loader)
-
-        Since _meta_step unrolls inner model 0 for self.inner_steps batches
-        and then inner model 1 for self.inner_steps batches BEFORE the single
-        outer/Rater update, each inner classifier sees every training sample
-        exactly once before every Rater update.
-        """
-        os.makedirs(
-            output_dir,
-            exist_ok=True,
-        )
-
-        self.meta_log_path = os.path.join(
-            output_dir,
-            "log.txt",
-        )
-
-        with open(
-            self.meta_log_path,
-            "w",
-            encoding="utf-8",
-        ) as fout:
-            fout.write(
-                "Rater meta-learning log\n"
-            )
-
+    def train(self, output_dir, split="train"):
+        """Meta-train only the rater; keep the notebook's training protocol intact."""
+        os.makedirs(output_dir, exist_ok=True)
         if self.precompute_embeddings_only:
-            self._precompute_shared_embeddings(
-                output_dir
-            )
+            self._precompute_shared_embeddings(output_dir)
             return
-
-        cache_dir = self._resolve_embedding_cache_dir(
-            output_dir
-        )
-
-        inner_split, outer_split = self._resolve_meta_splits(
-            split
-        )
-
-        self._meta_log(
-            f"[Rater] inner/meta-train={inner_split}"
-        )
-        self._meta_log(
-            f"[Rater] outer/meta-loss={outer_split}"
-        )
-
-        train_dataset = self._extract_embedding_dataset(
-            inner_split,
-            cache_dir,
-        )
-        val_dataset = self._extract_embedding_dataset(
-            outer_split,
-            cache_dir,
-        )
-        test_dataset = self._extract_embedding_dataset(
-            "test",
-            cache_dir,
-        )
-
-        untouched_val_dataset = None
-        if (
-            float(getattr(self.config, "split_val", 1.0)) < 1.0
-            and "val_subset2" in self.dataloaders
-        ):
-            untouched_val_dataset = self._extract_embedding_dataset(
-                "val_subset2",
-                cache_dir,
-            )
-
-        # All needed embeddings are now in CPU tensors. Release the frozen
-        # ResNet-50 so the 38-step differentiable inner unroll has more GPU RAM.
+        inner_split, outer_split = self._resolve_meta_splits(split)
+        split_names = {"train": inner_split, "val": outer_split, "test": "test"}
+        if self._has_ea_calibration_split() and "val_subset2" not in split_names.values():
+            split_names["heldout_val"] = "val_subset2"
+        cache_dir = self._resolve_embedding_cache_dir(output_dir)
+        by_split = {name: self._extract_embedding_dataset(name, cache_dir)
+                    for name in dict.fromkeys(split_names.values())}
+        datasets = {role: by_split[name] for role, name in split_names.items()}
+        if any(len(dataset) == 0 for dataset in datasets.values()):
+            raise ValueError("Cannot train or evaluate the rater on an empty split.")
+        # Keep image-space diagnostics available without occupying meta-unroll GPU RAM.
         if self.feature_model is not None:
             self.feature_model.cpu()
-            del self.feature_model
-            self.feature_model = None
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-
-        train_loader = DataLoader(
-            train_dataset,
-            batch_size=self.config.batch_size,
-            shuffle=True,
-            num_workers=self.config.num_workers,
-            pin_memory=True,
-        )
-        val_loader = DataLoader(
-            val_dataset,
-            batch_size=self.config.batch_size,
-            shuffle=False,
-            num_workers=self.config.num_workers,
-            pin_memory=True,
-        )
-
-        # ----------------------------------------------------
-        # FULL-EPOCH GUARANTEE
-        # ----------------------------------------------------
-        # Waterbirds: 4795 / 128 -> 38 batches.
-        # This is dynamic, so it stays correct if the split changes.
-        # ----------------------------------------------------
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        self._start_artifacts(output_dir, split_names, datasets)
+        train_loader = DataLoader(datasets["train"], batch_size=self.config.batch_size,
+                                  shuffle=True, num_workers=self.config.num_workers)
+        outer_loader = DataLoader(datasets["val"], batch_size=self.config.batch_size,
+                                  shuffle=False, num_workers=self.config.num_workers)
         self.inner_steps = len(train_loader)
-
-        self._meta_log(
-            f"[Rater] train_n={len(train_dataset)}, "
-            f"batch_size={self.config.batch_size}, "
-            f"full_inner_steps={self.inner_steps}"
-        )
-        self._meta_log(
-            "[Rater] Before EVERY Rater update, BOTH inner models "
-            "see the complete training set exactly once."
-        )
-        self._meta_log(
-            "[Rater] Inner classifiers are random from scratch and "
-            "are NEVER refreshed during the 500 meta steps."
-        )
-
-        train_iterator = iter(train_loader)
-        val_iterator = iter(val_loader)
-
+        # Keep the original iterator/population initialization order.
+        train_iterator, outer_iterator = iter(train_loader), iter(outer_loader)
         self._initialize_inner_population()
-
+        self._meta_log(f"[Rater] inner={inner_split}; outer={outer_split}; full_inner_steps={self.inner_steps}")
+        self._meta_log(f"[Rater] meta objective={self.outer_loss_type}; group annotations are diagnostic-only.")
+        initial = self._evaluate_inner_diagnostics(output_dir, 0, datasets, split_names)
+        for role, dataset in datasets.items():
+            self._score_snapshot(output_dir, 0, role, split_names[role], dataset)
+        history = []
         best_outer_loss = float("inf")
         best_step = None
-        best_rater_state = None
-
-        history = []
-        group_trajectory = []
-
-        self._meta_log(
-            "[Rater] All samples receive Rater ratings "
-            "regardless of correctness."
-        )
-        self._meta_log(
-            f"[Rater] Outer/Rater loss = {self.outer_loss_type} over "
-            "the full outer split; group annotations are NOT used in the loss."
-        )
-        self._meta_log(
-            f"[Rater] meta_steps={self.meta_steps}, "
-            f"inner_models={self.num_inner_models}, "
-            f"all_sample_weighting={self.weighting}, "
-            f"inner_lr={self.inner_lr}, "
-            f"outer_lr={self.outer_lr}, "
-            f"temperature={self.temperature}, "
-            f"outer_loss={self.outer_loss_type}, "
-            f"outer_top_loss_percent={self.outer_top_loss_percent:g}, "
-            f"outer_lse_beta={self.outer_lse_beta:g}, "
-            f"grad_clip={self.grad_clip}"
-        )
-
-        for meta_step in tqdm(
-            range(1, self.meta_steps + 1),
-            desc="Rater full-epoch meta-training",
-        ):
-            (
-                total_meta_loss,
-                outer_objective,
-                _,
-                train_iterator,
-                val_iterator,
-            ) = self._meta_step(
-                train_iterator,
-                val_iterator,
-                train_loader,
-                val_loader,
-            )
-
-            history.append(
-                {
-                    "step": int(meta_step),
-                    "outer_loss": float(outer_objective),
-                }
-            )
-
-            tail_parts = []
-            if getattr(self, "_last_outer_stats", None):
-                # Counts are the same for both inner models because the full
-                # outer split is used; report model 0 for a concise live line.
-                for class_id, stat in sorted(
-                    self._last_outer_stats[0].items()
-                ):
-                    if "k_selected" in stat:
-                        tail_parts.append(
-                            f"c{class_id}:top{stat['k_selected']}/{stat['n_class']}"
-                        )
-                    else:
-                        tail_parts.append(
-                            f"c{class_id}:mean={stat['mean_loss']:.4f}"
-                        )
-
-            self._meta_log(
-                f"[META {meta_step:03d}/{self.meta_steps}] "
-                f"outer_{self.outer_loss_type}="
-                f"{outer_objective:.6f}"
-                + (
-                    " | " + ", ".join(tail_parts)
-                    if tail_parts
-                    else ""
-                )
-            )
-
-            if outer_objective < best_outer_loss:
-                best_outer_loss = float(outer_objective)
-                best_step = int(meta_step)
-                best_rater_state = {
-                    key: value.detach().cpu().clone()
-                    for key, value in self.rater.state_dict().items()
-                }
-
-            should_eval = (
-                meta_step == 1
-                or meta_step % self.eval_freq == 0
-                or meta_step == self.meta_steps
-            )
-            should_plot = (
-                meta_step == 1
-                or meta_step % self.plot_freq == 0
-                or meta_step == self.meta_steps
-            )
-
+        checkpoint_dir = os.path.join(output_dir, "plots", "checkpoints")
+        best_path = os.path.join(checkpoint_dir, "best_meta.pt")
+        for step in tqdm(range(1, self.meta_steps + 1), desc="Rater full-epoch meta-training"):
+            # Associate each measured outer loss with the rater that produced it.
+            candidate_rater = _cpu_state(self.rater)
+            candidate_optimizer = copy.deepcopy(self.outer_optimizer.state_dict())
+            _, outer_loss, _, train_iterator, outer_iterator = self._meta_step(
+                train_iterator, outer_iterator, train_loader, outer_loader)
+            if not math.isfinite(outer_loss):
+                raise RuntimeError(f"Nonfinite meta objective at step {step}.")
+            row = {"step": step, "outer_loss": outer_loss,
+                   "elapsed_seconds": time.monotonic() - self._run_started}
+            history.append(row)
+            _append_csv(_diagnostic_path(output_dir, "meta_history.csv"), [row])
+            with open(_diagnostic_path(output_dir, "outer_objective_details.jsonl"), "a", encoding="utf-8") as fout:
+                fout.write(json.dumps(_json_value({"step": step, "models": self._last_outer_stats})) + "\n")
+            self._meta_log(f"[META {step:04d}] {self.outer_loss_type}={outer_loss:.6f}")
+            latest = self._checkpoint_payload(step)
+            latest.update(meta_step=step, outer_loss=outer_loss,
+                          loss_timing="before_rater_optimizer_update")
+            if outer_loss < best_outer_loss:
+                best_outer_loss, best_step = outer_loss, step
+                selected = {**latest, "rater_sd": candidate_rater,
+                            "outer_optimizer_sd": candidate_optimizer,
+                            "best_meta_step": step, "best_outer_loss": outer_loss,
+                            "checkpoint_kind": "selected_pre_update_rater_with_committed_inner_models"}
+                _atomic_torch_save(selected, best_path)
+            latest.update(best_meta_step=best_step, best_outer_loss=best_outer_loss,
+                          checkpoint_kind="latest_after_optimizer_update")
+            _atomic_torch_save(latest, os.path.join(checkpoint_dir, "latest_meta.pt"))
+            if self.save_freq > 0 and step % self.save_freq == 0:
+                _atomic_torch_save(latest, os.path.join(checkpoint_dir, f"meta_{step:06d}.pt"))
+            should_eval = step == 1 or step % self.eval_freq == 0 or step == self.meta_steps
+            should_plot = step == 1 or step % self.plot_freq == 0 or step == self.meta_steps
             if should_eval or should_plot:
-                population_metrics = self._evaluate_inner_population(
-                    val_dataset,
-                    verbose=should_eval,
-                )
-                relationship = self._score_loss_relationship(
-                    val_dataset,
-                    models=self.inner_models,
-                )
-
-                scores = np.asarray(
-                    relationship["scores"]
-                )
-                weights = np.asarray(
-                    relationship["final_scores"]
-                )
-                groups = np.asarray(
-                    relationship["groups"]
-                )
-
-                for gid in sorted(np.unique(groups)):
-                    mask = groups == gid
-                    group_trajectory.append(
-                        {
-                            "step": int(meta_step),
-                            "group": int(gid),
-                            "raw_mean": float(scores[mask].mean()),
-                            "weight_mean": float(weights[mask].mean()),
-                        }
-                    )
-
-                self._meta_log(
-                    f"[step {meta_step:04d}] "
-                    f"outer_{self.outer_loss_type}="
-                    f"{outer_objective:.6f}, "
-                    f"mean_inner_acc="
-                    f"{100.0 * population_metrics['mean_accuracy']:.2f}%, "
-                    f"mean_inner_WGA="
-                    f"{100.0 * population_metrics['mean_wga']:.2f}%, "
-                    f"Spearman(score,loss)="
-                    f"{relationship['spearman_score_vs_loss']:.4f}, "
-                    f"Spearman(weight,loss)="
-                    f"{relationship['spearman_final_score_vs_loss']:.4f}"
-                )
-
-                if should_plot:
-                    tag = f"step_{meta_step:04d}"
-                    self._save_all_score_diagnostics(
-                        relationship=relationship,
-                        output_dir=output_dir,
-                        meta_step=meta_step,
-                        split_name=outer_split,
-                        tag_prefix="meta_step",
-                    )
-                    self._save_meta_rate_box_ecdf(
-                        relationship=relationship,
-                        output_dir=output_dir,
-                        tag=tag,
-                        split_name=outer_split,
-                    )
-
-        if best_rater_state is None:
-            raise RuntimeError(
-                "No valid Rater state was produced."
-            )
-
-        # Restore best Rater in memory.
-        self.rater.load_state_dict(
-            best_rater_state
-        )
-        self.rater.to(self.device)
+                self._evaluate_inner_diagnostics(output_dir, step, datasets, split_names)
+            if should_plot:
+                for role, dataset in datasets.items():
+                    self._score_snapshot(output_dir, step, role, split_names[role], dataset)
+                self._save_metric_curves(output_dir)
+                self._save_meta_training_curves(history, self._group_rows, output_dir)
+        selected = torch.load(best_path, map_location="cpu", weights_only=False)
+        self.rater.load_state_dict(selected["rater_sd"])
+        self.outer_optimizer.load_state_dict(selected["outer_optimizer_sd"])
+        for model, state in zip(self.inner_models, selected["inner_model_sds"]):
+            model.load_state_dict(state)
         self.rater.eval()
-
-        self._meta_log(
-            f"[Rater] restored best step={best_step}, "
-            f"best_outer_loss={best_outer_loss:.8f}"
-        )
-
-        # Save ONE compact reusable model.
-        final_rater_path = os.path.join(
-            output_dir,
-            "final_rater.pt",
-        )
-
-        torch.save(
-            {
-                "rater_sd": self.rater.state_dict(),
-                "meta_steps": int(self.meta_steps),
-                "best_meta_step": int(best_step),
-                "best_outer_loss": float(best_outer_loss),
-                "outer_loss_type": str(self.outer_loss_type),
-                "outer_lse_beta": float(self.outer_lse_beta),
-                "outer_top_loss_percent_per_class": float(
-                    self.outer_top_loss_percent
-                ),
-                "outer_loss_uses_group_annotations": False,
-                "outer_loss_class_aggregation": {
-                    "classwise_top_loss": "equal_mean_of_per_class_top_tail_means",
-                    "class_balanced": "equal_mean_of_per_class_mean_losses",
-                    "worst_class_loss": "maximum_per_class_mean_loss",
-                    "logsumexp": "normalized_logsumexp_over_all_examples",
-                }[self.outer_loss_type],
-                "feature_dim": int(self.feature_dim),
-                "num_classes": int(self.n_classes),
-                "backbone": str(self.config.backbone),
-                "rater_capacity": str(self.rater_capacity),
-                "weighting": str(self.weighting),
-                "temperature": float(self.temperature),
-                "ea_style_gate": "all=RaterRating",
-                "rate_all_samples": True,
-                "rater_applied_only_to_misclassified": False,
-                "inner_models": 2,
-                "inner_initialization": "independent_random_linear",
-                "full_train_epoch_before_each_meta_update": True,
-                "full_inner_steps": int(self.inner_steps),
-                "inner_lr": float(self.inner_lr),
-                "outer_lr": float(self.outer_lr),
-                "erm_model_path": str(self.erm_model_path),
-                "erm_fingerprint": str(self.erm_checkpoint_fingerprint),
-                "erm_epoch": self.erm_checkpoint_epoch,
-            },
-            final_rater_path,
-        )
-
-        self._save_meta_training_curves(
-            history,
-            group_trajectory,
-            output_dir,
-        )
-
-        # ----------------------------------------------------
-        # FINAL BEST-RATER diagnostics.
-        # ----------------------------------------------------
-        datasets = {
-            inner_split: train_dataset,
-            outer_split: val_dataset,
-            "test": test_dataset,
+        # Preserve the standalone notebook's checkpoint contract and keep it compact.
+        export = {
+            "rater_sd": _cpu_state(self.rater), "meta_steps": self.meta_steps,
+            "best_meta_step": best_step, "best_outer_loss": best_outer_loss,
+            "outer_loss_type": self.outer_loss_type, "outer_lse_beta": self.outer_lse_beta,
+            "outer_top_loss_percent_per_class": self.outer_top_loss_percent,
+            "outer_loss_uses_group_annotations": False,
+            "outer_loss_class_aggregation": {
+                "classwise_top_loss": "equal_mean_of_per_class_top_tail_means",
+                "class_balanced": "equal_mean_of_per_class_mean_losses",
+                "worst_class_loss": "maximum_per_class_mean_loss",
+                "logsumexp": "normalized_logsumexp_over_all_examples",
+            }[self.outer_loss_type],
+            "feature_dim": self.feature_dim, "num_classes": self.n_classes,
+            "backbone": self.config.backbone, "rater_capacity": self.rater_capacity,
+            "weighting": self.weighting, "temperature": self.temperature,
+            "ea_style_gate": "all=RaterRating", "rate_all_samples": True,
+            "rater_applied_only_to_misclassified": False,
+            "inner_models": self.num_inner_models, "inner_initialization": "independent_random_linear",
+            "full_train_epoch_before_each_meta_update": True, "full_inner_steps": self.inner_steps,
+            "inner_lr": self.inner_lr, "outer_lr": self.outer_lr,
+            "erm_model_path": self.erm_model_path, "erm_fingerprint": self.erm_checkpoint_fingerprint,
+            "erm_epoch": self.erm_checkpoint_epoch,
         }
+        _atomic_torch_save(export, os.path.join(output_dir, "final_rater.pt"))
+        self._selected_inner_metrics = self._evaluate_inner_diagnostics(
+            output_dir, best_step, datasets, split_names, phase="selected")
+        for role, dataset in datasets.items():
+            self._score_snapshot(output_dir, best_step, role, split_names[role], dataset, phase="selected")
+        self._save_gradcam(output_dir, "selected", split_names.values(),
+                           {"rater": self.rater, **{f"inner_{i}": m for i, m in enumerate(self.inner_models)}})
+        summary = {
+            "seed": self.config.seed, "status": "complete", "stage": "meta",
+            "best_meta_step": best_step, "best_outer_loss": best_outer_loss,
+            "calibration_size": len(datasets["val"]),
+            "initial_inner_metrics": initial, "selected_inner_metrics": self._selected_inner_metrics,
+            "elapsed_seconds": time.monotonic() - self._run_started, "split_names": split_names,
+            "notes": ["Only the rater is trained/exported; downstream training is a separate notebook.",
+                      "Each inner model sees a full training epoch before each rater update.",
+                      "Losses are unweighted mean CE; worst_group_loss is the largest observed group-mean CE.",
+                      "Diagnostic weights use fixed ordered batches and are batch-relative.",
+                      "Group counts are logged; absent groups are excluded from WGA and worst-group loss.",
+                      "Held-out validation and test metrics do not select the rater.",
+                      "Selected inner heads match the selected rater's meta step."],
+        }
+        _write_json(_diagnostic_path(output_dir, "summary.json"), summary)
+        lines = ["RATER META-LEARNING SUMMARY", f"Seed: {self.config.seed}",
+                 f"Splits: {split_names}", f"Calibration samples: {summary['calibration_size']}",
+                 f"Selected meta step: {best_step}; outer loss: {best_outer_loss:.6f}", ""]
+        for name, by_split in self._selected_inner_metrics.items():
+            for role, metrics in by_split.items():
+                lines.append(f"{name}/{role}: " + ", ".join(
+                    f"{field}={metrics[field]:.6f}" for field in METRIC_FIELDS))
+        lines.extend(["", *summary["notes"], "", "Artifacts:",
+                      "final_rater.pt: compact rater export compatible with the standalone notebook",
+                      "plots/: existing distributions, per-inner-model curves and selected-model Grad-CAM",
+                      "plots/data/: metric/group CSVs, source NPZs, metadata, indices and summary.json",
+                      "plots/checkpoints/: best/latest population + optimizer/RNG states and optional snapshots",
+                      "log.txt, summary.txt"])
+        with open(os.path.join(output_dir, "summary.txt"), "w", encoding="utf-8") as fout:
+            fout.write("\n".join(lines) + "\n")
+        self._meta_log(f"[Rater] Meta-training complete; exported {os.path.join(output_dir, 'final_rater.pt')}")
 
-        if untouched_val_dataset is not None:
-            datasets["val_subset2"] = untouched_val_dataset
-
-        final_relationships = {}
-        final_metrics = {}
-
-        for split_name, dataset in datasets.items():
-            relationship = self._score_loss_relationship(
-                dataset,
-                models=self.inner_models,
-            )
-            final_relationships[split_name] = relationship
-            final_metrics[split_name] = self._evaluate_inner_population(
-                dataset,
-                verbose=False,
-            )
-
-            self._save_all_score_diagnostics(
-                relationship=relationship,
-                output_dir=output_dir,
-                meta_step=self.meta_steps,
-                split_name=split_name,
-                tag_prefix="FINAL_BEST_RATER",
-            )
-            self._save_meta_rate_box_ecdf(
-                relationship=relationship,
-                output_dir=output_dir,
-                tag="FINAL_BEST_RATER",
-                split_name=split_name,
-            )
-
-            self._meta_log(
-                f"[FINAL {split_name}] "
-                f"raw_mean={np.asarray(relationship['scores']).mean():.6f}, "
-                f"weight_mean="
-                f"{np.asarray(relationship['final_scores']).mean():.6f}"
-            )
-
-        summary_path = self._write_meta_summary(
-            output_dir=output_dir,
-            best_step=best_step,
-            best_outer_loss=best_outer_loss,
-            final_relationships=final_relationships,
-            final_metrics=final_metrics,
-        )
-
-        self._meta_log(
-            f"[Rater] saved final_rater.pt={final_rater_path}"
-        )
-        self._meta_log(
-            f"[Rater] saved summary={summary_path}"
-        )
-
-    # ========================================================
-    # Test / final evaluation
-    # ========================================================
-
-    def test(
-        self,
-        output_dir,
-        split=("test",),
-        result_path="",
-    ):
+    def test(self, output_dir, split=("test",), result_path=""):
+        """Compatibility with main.py: classification diagnostics are part of train()."""
         del output_dir, split, result_path
-
         if self.precompute_embeddings_only:
             return
+        log("[Rater] Meta-only run. Inner-model metrics are in plots/data/; "
+            "final_rater.pt is ready for the standalone downstream notebook.")
+        return getattr(self, "_selected_inner_metrics", {})
 
-        log(
-            "[Rater] Meta-learning-only run complete. "
-            "No final classifier is trained in this rater.py."
-        )
+
+def _mean_std(values):
+    values = np.asarray(values, dtype=float)
+    return float(values.mean()), float(values.std(ddof=1)) if len(values) > 1 else 0.0
+
+
+def _read_diagnostic_run(run_dir):
+    data_dir = _diagnostic_path(run_dir)
+    with open(os.path.join(data_dir, "run_config.json"), encoding="utf-8") as fin:
+        metadata = json.load(fin)
+    rows = {}
+    for filename in ("metrics.csv", "group_statistics.csv"):
+        with open(os.path.join(data_dir, filename), newline="", encoding="utf-8") as fin:
+            values = list(csv.DictReader(fin))
+        for row in values:
+            if int(row["seed"]) != int(metadata["seed"]) or row["stage"] != "meta":
+                raise ValueError(f"Expected one meta-training seed in {data_dir}/{filename}.")
+        rows[filename] = values
+    return metadata, rows
+
+
+def plot_run_comparison(run_dirs, output_dir, comparison):
+    """Observed calibration-size/initial-WGA comparisons from existing meta runs only."""
+    if comparison not in {"calibration_size", "initial_wga"}:
+        raise ValueError("comparison must be calibration_size or initial_wga")
+    points, references = [], None
+    for run_dir in run_dirs:
+        info, data = _read_diagnostic_run(run_dir)
+        settings = dict(info["settings"])
+        if comparison == "calibration_size":
+            settings.pop("calibration_size", None)
+            settings.pop("split_val", None)
+        if references is not None and settings != references:
+            raise ValueError("Comparison runs differ in settings beyond the requested variable and seed.")
+        references = settings
+        initial_wga = {r["model"]: float(r["worst_group_accuracy"])
+                       for r in data["metrics.csv"] if r["phase"] == "trajectory"
+                       and int(r["step"]) == 0 and r["role"] == "val"}
+        selected = [r for r in data["metrics.csv"] if r["phase"] == "selected"]
+        if not selected:
+            raise ValueError(f"No selected-rater metrics in {run_dir}; comparisons need completed runs.")
+        for row in selected:
+            x = info["settings"]["calibration_size"] if comparison == "calibration_size" else initial_wga[row["model"]]
+            points.append({"seed": int(info["seed"]), "model": row["model"], "split": row["split"],
+                           "role": row["role"], "x": x, "selected_meta_step": int(row["step"]),
+                           "run_dir": os.path.abspath(run_dir),
+                           **{field: float(row[field]) for field in METRIC_FIELDS}})
+    if not points:
+        raise ValueError("No comparison data found.")
+    os.makedirs(output_dir, exist_ok=True)
+    _write_csv(os.path.join(output_dir, f"{comparison}_observations.csv"), points)
+    grouped = defaultdict(list)
+    for point in points:
+        grouped[(point["model"], point["split"], point["x"])].append(point)
+    rows = []
+    for (model, split, x), values in sorted(grouped.items()):
+        if len({v["seed"] for v in values}) != len(values):
+            raise ValueError(f"Repeated seed/condition for {model}/{split}/{x}.")
+        row = {"model": model, "split": split, "x": x, "n_seeds": len(values)}
+        for field in METRIC_FIELDS:
+            row[field + "_mean"], row[field + "_std"] = _mean_std([v[field] for v in values])
+        rows.append(row)
+    _write_csv(os.path.join(output_dir, f"{comparison}_mean_std.csv"), rows)
+    for model in sorted({r["model"] for r in rows}):
+        fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+        for ax, field, label in zip(axes.flat, METRIC_FIELDS, METRIC_LABELS):
+            for split in sorted({r["split"] for r in rows if r["model"] == model}):
+                values = sorted((r for r in rows if r["model"] == model and r["split"] == split),
+                                key=lambda r: r["x"])
+                ax.errorbar([r["x"] for r in values], [r[field + "_mean"] for r in values],
+                            yerr=[r[field + "_std"] for r in values], marker="o", capsize=3,
+                            linestyle="-" if comparison == "calibration_size" else "none", label=split)
+            ax.set(xlabel="Outer calibration samples" if comparison == "calibration_size" else "Initial outer-validation WGA",
+                   ylabel=label)
+            ax.grid(alpha=.25)
+            ax.legend(fontsize=8)
+        fig.suptitle(f"{model} at selected-rater step: observed {comparison} comparison")
+        fig.tight_layout()
+        fig.savefig(os.path.join(output_dir, f"{model}_{comparison}.png"), dpi=160)
+        plt.close(fig)
+    _write_json(os.path.join(output_dir, "comparison.json"), {
+        "comparison": comparison,
+        "interpretation": "Observed meta-training outcomes, not a controlled causal sensitivity experiment.",
+        "initial_wga_split": "outer calibration split",
+        "note": "Changing split_val may also change held-out validation membership; use recorded split IDs.",
+        "runs": [os.path.abspath(p) for p in run_dirs],
+    })
+    return rows
+
+
+def plot_multi_seed_runs(run_dirs, output_dir):
+    """Aggregate observed meta steps, without interpolating missing evaluations."""
+    all_rows, group_rows = [], []
+    seeds, metadata = set(), []
+    reference = None
+    for run_dir in run_dirs:
+        info, data = _read_diagnostic_run(run_dir)
+        seed = int(info["seed"])
+        if seed in seeds:
+            raise ValueError(f"Seed {seed} occurs twice; pass one run per seed and condition.")
+        seeds.add(seed)
+        comparable = {"settings": info["settings"], "splits": info["splits"], "split_sizes": info["split_sizes"]}
+        if reference is not None and comparable != reference:
+            raise ValueError("Runs have different settings or splits; aggregate one condition at a time, or use --compare.")
+        reference = comparable
+        metadata.append({"seed": seed, "run_dir": os.path.abspath(run_dir)})
+        all_rows.extend(data["metrics.csv"])
+        group_rows.extend(data["group_statistics.csv"])
+    if not all_rows:
+        raise ValueError("No metric rows found.")
+    os.makedirs(output_dir, exist_ok=True)
+    _write_json(os.path.join(output_dir, "runs.json"), metadata)
+    grouped = defaultdict(list)
+    for row in all_rows:
+        key = (row["phase"], row["model"], row["split"], row["role"],
+               int(row["step"]) if row["phase"] == "trajectory" else -1)
+        grouped[key].append(row)
+    aggregate = []
+    for key, values in sorted(grouped.items()):
+        if len({int(v["seed"]) for v in values}) != len(values):
+            raise ValueError(f"Duplicate metric observation for {key}.")
+        result = dict(zip(("phase", "model", "split", "role", "step"), key))
+        result["n_seeds"] = len(values)
+        for field in METRIC_FIELDS:
+            result[field + "_mean"], result[field + "_std"] = _mean_std([v[field] for v in values])
+        aggregate.append(result)
+    _write_csv(os.path.join(output_dir, "metrics_mean_std.csv"), aggregate)
+    for model, phase in sorted({(r["model"], r["phase"]) for r in aggregate}):
+        rows = [r for r in aggregate if (r["model"], r["phase"]) == (model, phase)]
+        fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+        for ax, field, label in zip(axes.flat, METRIC_FIELDS, METRIC_LABELS):
+            if phase == "selected":
+                ax.bar([r["split"] for r in rows], [r[field + "_mean"] for r in rows],
+                       yerr=[r[field + "_std"] for r in rows], capsize=3)
+                ax.tick_params(axis="x", labelrotation=15)
+            else:
+                for split in sorted({r["split"] for r in rows}):
+                    values = sorted((r for r in rows if r["split"] == split), key=lambda r: r["step"])
+                    x = np.array([r["step"] for r in values])
+                    mean = np.array([r[field + "_mean"] for r in values])
+                    std = np.array([r[field + "_std"] for r in values])
+                    counts = [r["n_seeds"] for r in values]
+                    ax.plot(x, mean, label=f"{split} (n={min(counts)}–{max(counts)})")
+                    ax.fill_between(x, mean - std, mean + std, alpha=.15)
+                ax.set_xlabel("Meta step")
+                ax.legend(fontsize=8)
+            ax.set_ylabel(label)
+            ax.grid(alpha=.25)
+        fig.suptitle(f"{model}/{phase}: mean ± seed SD")
+        fig.tight_layout()
+        fig.savefig(os.path.join(output_dir, f"{model}_{phase}.png"), dpi=160)
+        plt.close(fig)
+    grouped = defaultdict(list)
+    for row in group_rows:
+        if row["phase"] == "trajectory":
+            grouped[(row["split"], int(row["group"]), int(row["step"]))].append(row)
+    group_aggregate = []
+    for key, values in sorted(grouped.items()):
+        if len({int(v["seed"]) for v in values}) != len(values):
+            raise ValueError(f"Duplicate group-weight observation for {key}.")
+        result = dict(zip(("split", "group", "step"), key))
+        result["n_seeds"] = len(values)
+        for field in ("raw_mean", "weight_mean", "weight_mass_share"):
+            result[field + "_mean"], result[field + "_std"] = _mean_std([v[field] for v in values])
+        group_aggregate.append(result)
+    _write_csv(os.path.join(output_dir, "group_weights_mean_std.csv"), group_aggregate)
+    for split in sorted({r["split"] for r in group_aggregate}):
+        fig, axes = plt.subplots(1, 3, figsize=(16, 4))
+        for ax, field in zip(axes, ("raw_mean", "weight_mean", "weight_mass_share")):
+            for group in sorted({r["group"] for r in group_aggregate if r["split"] == split}):
+                values = sorted((r for r in group_aggregate if (r["split"], r["group"]) == (split, group)),
+                                key=lambda r: r["step"])
+                x = [r["step"] for r in values]
+                mean = np.array([r[field + "_mean"] for r in values])
+                std = np.array([r[field + "_std"] for r in values])
+                ax.plot(x, mean, label=f"Group {group}")
+                ax.fill_between(x, mean - std, mean + std, alpha=.15)
+            ax.set(xlabel="Meta step", ylabel=field)
+            ax.legend(fontsize=8)
+        fig.suptitle(f"{split}: group weights, mean ± seed SD")
+        fig.tight_layout()
+        fig.savefig(os.path.join(output_dir, f"{split}_group_weights.png"), dpi=160)
+        plt.close(fig)
+    return aggregate
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Plot existing rater meta-training runs; never launch training.")
+    parser.add_argument("--runs", nargs="+", required=True, help="Existing rater output directories.")
+    parser.add_argument("--output", required=True, help="Directory for aggregate CSVs and figures.")
+    parser.add_argument("--compare", choices=("calibration_size", "initial_wga"),
+                        help="Compare existing runs instead of averaging a single condition across seeds.")
+    args = parser.parse_args()
+    if args.compare:
+        plot_run_comparison(args.runs, args.output, args.compare)
+    else:
+        plot_multi_seed_runs(args.runs, args.output)

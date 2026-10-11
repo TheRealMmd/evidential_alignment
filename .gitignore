@@ -137,5 +137,3 @@ combine_py_to_markdown.py
 all_python_code.md
 
 *.tex
-
-*.ipynb
