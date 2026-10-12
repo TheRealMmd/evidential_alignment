@@ -565,6 +565,9 @@ class Rater(Algorithm):
             )
         ).lower()
         valid_outer_losses = {
+            "standard_ce",
+            "worst_group_loss",
+            "group_balanced_loss",
             "classwise_top_loss",
             "class_balanced",
             "worst_class_loss",
@@ -679,11 +682,8 @@ class Rater(Algorithm):
         #   every training sample receives a Rater-derived weight, and
         #   L_inner = SUM_i w_i * CE_i.
         #
-        # Outer/Rater loss:
-        #   class-wise top-loss tail on the outer split. For each class,
-        #   take the top self.outer_top_loss_percent percent CE losses, mean
-        #   them, then average the class-tail means equally. No group labels
-        #   are used by the outer objective.
+        # Outer/Rater loss is configurable. Group labels are consumed only
+        # when worst_group_loss or group_balanced_loss is selected.
         #
         # There is NO gradient-magnitude auxiliary loss and no additional
         # Rater regularizer in the meta objective.
@@ -805,11 +805,15 @@ class Rater(Algorithm):
             "[Rater] Inner objective: L_inner = sum_i w_i * CE_i "
             "WITHOUT dividing by sum(w)."
         )
+        uses_groups = self.outer_loss_type in {
+            "worst_group_loss",
+            "group_balanced_loss",
+        }
         log(
             f"[Rater] Meta objective = {self.outer_loss_type}; "
             f"top-loss percent={self.outer_top_loss_percent:g}%; "
             f"LSE beta={self.outer_lse_beta:g}; "
-            "group labels are NOT used."
+            f"group labels used={uses_groups}."
         )
         log(
             f"[Rater] Inner population = {self.num_inner_models}; "
@@ -1735,8 +1739,9 @@ class Rater(Algorithm):
         self,
         per_sample_losses,
         labels,
+        groups=None,
     ):
-        """Compute the selected group-blind Rater meta objective."""
+        """Compute the selected Rater meta objective and group/class stats."""
         if per_sample_losses.ndim != 1:
             raise ValueError("per_sample_losses must be a 1-D tensor.")
         labels = labels.reshape(-1)
@@ -1744,6 +1749,43 @@ class Rater(Algorithm):
             raise ValueError("Loss and label tensors must have the same length.")
         if per_sample_losses.numel() == 0:
             raise RuntimeError("The outer split contains no examples.")
+
+        if self.outer_loss_type == "standard_ce":
+            return per_sample_losses.mean(), {
+                "sample_count": int(per_sample_losses.numel()),
+                "mean_loss": float(per_sample_losses.detach().mean().item()),
+            }
+
+        if self.outer_loss_type in {
+            "worst_group_loss",
+            "group_balanced_loss",
+        }:
+            if groups is None:
+                raise ValueError(
+                    f"groups are required for outer_loss={self.outer_loss_type}."
+                )
+            groups = groups.reshape(-1)
+            if groups.shape[0] != per_sample_losses.shape[0]:
+                raise ValueError("Loss and group tensors must have the same length.")
+
+            group_means = []
+            stats = {}
+            for group_id_tensor in torch.unique(groups):
+                group_id = int(group_id_tensor.item())
+                group_losses = per_sample_losses[groups.eq(group_id_tensor)]
+                group_mean = group_losses.mean()
+                group_means.append(group_mean)
+                stats[group_id] = {
+                    "n_group": int(group_losses.numel()),
+                    "mean_loss": float(group_mean.detach().item()),
+                }
+
+            if not group_means:
+                raise RuntimeError("The outer split contains no observed groups.")
+            group_means_tensor = torch.stack(group_means)
+            if self.outer_loss_type == "worst_group_loss":
+                return group_means_tensor.max(), stats
+            return group_means_tensor.mean(), stats
 
         if self.outer_loss_type == "classwise_top_loss":
             return self._classwise_top_loss_outer_objective(
@@ -1792,16 +1834,15 @@ class Rater(Algorithm):
         val_loader,
     ):
         """
-        One Rater update with the configured group-blind outer objective.
+        One Rater update with the configured outer objective.
 
         BOTH persistent inner models first complete self.inner_steps batches.
         train() sets self.inner_steps = len(train_loader), so each inner model
         sees the entire train_no_aug set once before the Rater update.
 
         After an inner model finishes its full training pass, its outer
-        per-example CE losses are computed on the ENTIRE outer split. For each
-        Per-example outer losses are aggregated using `self.outer_loss_type`.
-        Group annotations are ignored completely in this objective.
+        per-example CE losses and group ids are collected over the ENTIRE
+        outer split, then aggregated using `self.outer_loss_type`.
 
         For memory efficiency, each inner model's outer loss / num_models is
         backpropagated immediately. The Rater optimizer step happens only after
@@ -1828,12 +1869,13 @@ class Rater(Algorithm):
                 train_loader,
             )
 
-            # Collect outer per-example losses over the ENTIRE outer split.
-            # The third/fourth fields (group/background metadata) are ignored.
+            # Collect outer per-example losses and group ids over the entire
+            # outer split. Group ids affect the objective only in group modes.
             all_outer_losses = []
             all_outer_labels = []
+            all_outer_groups = []
 
-            for z_outer, y_outer, _, _ in val_loader:
+            for z_outer, y_outer, group_outer, _ in val_loader:
                 z_outer = z_outer.to(
                     self.device,
                     non_blocking=True,
@@ -1857,6 +1899,9 @@ class Rater(Algorithm):
 
                 all_outer_losses.append(per_outer_loss)
                 all_outer_labels.append(y_outer)
+                all_outer_groups.append(
+                    group_outer.to(self.device, non_blocking=True).reshape(-1)
+                )
 
             per_outer_loss = torch.cat(
                 all_outer_losses,
@@ -1866,11 +1911,13 @@ class Rater(Algorithm):
                 all_outer_labels,
                 dim=0,
             )
+            group_outer_all = torch.cat(all_outer_groups, dim=0)
 
             outer_loss, outer_stats = (
                 self._compute_outer_objective(
                     per_sample_losses=per_outer_loss,
                     labels=y_outer_all,
+                    groups=group_outer_all,
                 )
             )
 
@@ -3438,7 +3485,13 @@ class Rater(Algorithm):
         train_iterator, outer_iterator = iter(train_loader), iter(outer_loader)
         self._initialize_inner_population()
         self._meta_log(f"[Rater] inner={inner_split}; outer={outer_split}; full_inner_steps={self.inner_steps}")
-        self._meta_log(f"[Rater] meta objective={self.outer_loss_type}; group annotations are diagnostic-only.")
+        uses_groups = self.outer_loss_type in {
+            "worst_group_loss", "group_balanced_loss"
+        }
+        self._meta_log(
+            f"[Rater] meta objective={self.outer_loss_type}; "
+            f"group annotations used={uses_groups}."
+        )
         initial = self._evaluate_inner_diagnostics(output_dir, 0, datasets, split_names)
         for role, dataset in datasets.items():
             self._score_snapshot(output_dir, 0, role, split_names[role], dataset)
@@ -3498,8 +3551,13 @@ class Rater(Algorithm):
             "best_meta_step": best_step, "best_outer_loss": best_outer_loss,
             "outer_loss_type": self.outer_loss_type, "outer_lse_beta": self.outer_lse_beta,
             "outer_top_loss_percent_per_class": self.outer_top_loss_percent,
-            "outer_loss_uses_group_annotations": False,
+            "outer_loss_uses_group_annotations": self.outer_loss_type in {
+                "worst_group_loss", "group_balanced_loss"
+            },
             "outer_loss_class_aggregation": {
+                "standard_ce": "mean_over_all_outer_examples",
+                "worst_group_loss": "maximum_observed_group_mean_ce",
+                "group_balanced_loss": "equal_mean_of_observed_group_mean_ce",
                 "classwise_top_loss": "equal_mean_of_per_class_top_tail_means",
                 "class_balanced": "equal_mean_of_per_class_mean_losses",
                 "worst_class_loss": "maximum_per_class_mean_loss",

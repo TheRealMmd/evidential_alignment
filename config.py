@@ -621,13 +621,17 @@ def rater_args(parser):
         type=str,
         default="classwise_top_loss",
         choices=[
+            "standard_ce",
+            "worst_group_loss",
+            "group_balanced_loss",
             "classwise_top_loss",
             "class_balanced",
             "worst_class_loss",
             "logsumexp",
         ],
         help=(
-            "outer objective used to update the Rater: class-wise top-loss, "
+            "outer objective used to update the Rater: standard CE, "
+            "worst-group loss, group-balanced loss, class-wise top-loss, "
             "class-balanced mean loss, worst-class mean loss, or normalized "
             "log-sum-exp over all outer examples"
         ),

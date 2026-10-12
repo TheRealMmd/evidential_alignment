@@ -137,3 +137,9 @@ combine_py_to_markdown.py
 all_python_code.md
 
 *.tex
+
+ERM_Fresh_Classifier_Waterbirds_ERM_Embeddings_Baseline.ipynb
+Frozen_New_Rater_Waterbirds_ERM_Final_Classifier.ipynb
+Run_Rater_Classwise_TopLoss_ERM_Embeddings_Outer_Loss.ipynb
+Run_Rater_EA_Gated_FullEpoch_ERM_Embeddings_500Steps.ipynb
+Train_Waterbirds_ERM_Base_Model_For_Evidential_Alignment.ipynb
