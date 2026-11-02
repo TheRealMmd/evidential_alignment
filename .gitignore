@@ -115,6 +115,7 @@ venv.bak/
 datasets/__pycache__/
 models/__pycache__/
 *.txt
+!requirements.txt
 SubpopBench
 spurious_feature_learning
 salient_imagenet

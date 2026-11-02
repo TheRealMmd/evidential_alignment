@@ -8,15 +8,7 @@ dataset_paths = {
     "celeba": "/path/to/datasets/celeba",
     "multinli": "/path/to/datasets/multinli",
     "civilcomments": "/path/to/datasets/civilcomments",
-    "imagenet-9": "/path/to/datasets/imagenet",
-    "imagenet-a": "/path/to/datasets/imagenet-a",
-    "imagenet-bg": "/path/to/datasets/imagenet-bg",
-    "chexpert": "/path/to/datasets/chexpert",
 }
-
-NICO_DATA_FOLDER = "/path/to/nico_dataset"
-NICO_CXT_DIC_PATH = "/path/to/context_mapping.json"
-NICO_CLASS_DIC_PATH = "/path/to/class_mapping.json"
 
 
 # ============================================================

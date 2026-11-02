@@ -1,0 +1,14 @@
+torch
+torchvision
+timm
+transformers
+wilds
+wget
+numpy
+pandas
+scipy
+scikit-learn
+matplotlib
+opencv-python
+pillow
+tqdm

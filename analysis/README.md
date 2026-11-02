@@ -3,6 +3,7 @@
 Everything here reads artifacts the notebooks and `main.py` already write. Nothing trains
 except `run_baselines.py`, which launches the repository's own baselines.
 Scripts need `numpy pandas scipy matplotlib torch` (all present in Colab).
+`plot_final_classifier_multiseed.py` (moved here from the repository root) re-plots completed final-classifier runs.
 
 ## Stage 1: rater meta-training (`algorithms/rater.py`)
 New behaviour is **off by default**; existing runs are bit-identical (checked on a CPU

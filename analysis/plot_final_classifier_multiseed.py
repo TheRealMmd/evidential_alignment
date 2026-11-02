@@ -2,7 +2,7 @@
 """Aggregate completed final-classifier runs across seeds.
 
 Usage:
-    python plot_final_classifier_multiseed.py \
+    python analysis/plot_final_classifier_multiseed.py \
         --runs RUN_SEED0 RUN_SEED1 RUN_SEED2 \
         --output OUTPUT_DIR
 

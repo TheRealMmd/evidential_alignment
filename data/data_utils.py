@@ -130,11 +130,7 @@ def prepare_data(config):
     train_no_aug_dataset = dataset_class(basedir, "train", eval_transform)
     val_dataset = dataset_class(basedir, "val", eval_transform)
 
-    # build the test dataset
-    if dataset == 'imagenet-9':
-        test_dataset = dataset_class(dataset_paths['imagenet-a'], "test", eval_transform)
-    else:
-        test_dataset = dataset_class(basedir, "test", eval_transform)
+    test_dataset = dataset_class(basedir, "test", eval_transform)
     datasets =  {
             "train": train_dataset,
             "train_no_aug": train_no_aug_dataset,
@@ -142,13 +138,6 @@ def prepare_data(config):
             "test": test_dataset
         }
 
-    if dataset == 'imagenet-bg':
-        test_dict = {}
-        test_dict["mixed_rand"] = dataset_class(basedir, "mixed_rand", eval_transform)
-        test_dict["only_fg"] = dataset_class(basedir, "only_fg", eval_transform)
-        test_dict["no_fg"] = dataset_class(basedir, "no_fg", eval_transform)
-        datasets.update(test_dict)
-    
 
     if config.split_train < 1.0:
         train_split_path = os.path.join(basedir, f"train_split_{config.split_train:.2f}_seed{config.seed}.pickle")
