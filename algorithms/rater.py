@@ -3966,8 +3966,8 @@ class Rater(Algorithm):
             self._meta_log("[Rater] WARNING: exported rater = initial (untrained) rater; see summary.txt.")
         lines = ["RATER META-LEARNING SUMMARY", f"Seed: {self.config.seed}",
                  f"Splits: {split_names}", f"Calibration samples: {summary['calibration_size']}",
-                 f"Selected meta step: {best_step} (rule: {self.selection_rule}); "
-                 f"selection value: {best_outer_loss:.6f}", ""]
+                 f"Selected meta step: {best_step}; outer loss: {best_outer_loss:.6f}",
+                 f"Selection rule: {self.selection_rule}", ""]
         if selected_is_initial:
             lines[-1:-1] = ["WARNING: the exported rater is the INITIAL, never-updated rater. "
                             "Results with it measure an untrained network."]
