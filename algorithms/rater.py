@@ -49,7 +49,10 @@ if __name__ == "__main__":
 
     def register_algorithm(name):
         return lambda cls: cls
+
+    from rater_models import EmbeddingRaterMedium, EmbeddingRaterSmall, InnerLinearClassifier
 else:
+    from .rater_models import EmbeddingRaterMedium, EmbeddingRaterSmall, InnerLinearClassifier
     from .algorithm import Algorithm
     from .register import register_algorithm
     from models.classifier import Classifier
@@ -145,6 +148,40 @@ def _cpu_state(model):
     return {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
 
 
+def _env_flag(name, default=False):
+    value = os.environ.get(name)
+    if value is None or not value.strip():
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "y"}
+
+
+def _source_provenance():
+    """Git commit and sha256 of the rater.py actually executing (Colab may patch it)."""
+    path = os.path.abspath(__file__)
+    with open(path, "rb") as fin:
+        sha256 = hashlib.sha256(fin.read()).hexdigest()
+    commit, dirty = None, None
+    try:
+        import subprocess
+        repo = os.path.dirname(os.path.dirname(path))
+        commit = subprocess.run(["git", "-C", repo, "rev-parse", "HEAD"], capture_output=True,
+                                text=True, timeout=10).stdout.strip() or None
+        status = subprocess.run(["git", "-C", repo, "status", "--porcelain", "--", path],
+                                capture_output=True, text=True, timeout=10).stdout.strip()
+        dirty = bool(status) if commit else None
+    except Exception:
+        pass
+    return {"rater_py_sha256": sha256, "git_commit": commit,
+            "rater_py_modified_from_commit": dirty, "rater_py_path": path}
+
+
+def _device_compute_info():
+    if not torch.cuda.is_available():
+        return {"device": "cpu", "gpu_name": None, "peak_gpu_memory_bytes": None}
+    return {"device": "cuda", "gpu_name": torch.cuda.get_device_name(),
+            "peak_gpu_memory_bytes": int(torch.cuda.max_memory_allocated())}
+
+
 def _metric_figure(rows, title, xlabel="Step"):
     fig, axes = plt.subplots(2, 2, figsize=(12, 8))
     for ax, field, label in zip(axes.flat, METRIC_FIELDS, METRIC_LABELS):
@@ -190,63 +227,7 @@ class EmbeddingTensorDataset(Dataset):
         )
 
 
-# ============================================================
-# Rater architectures
-# ============================================================
-
-class EmbeddingRaterSmall(nn.Module):
-    """Small MLP rater for a ResNet-50 pooled embedding."""
-
-    def __init__(self, input_dim=2048):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.LayerNorm(input_dim),
-            nn.Linear(input_dim, 256),
-            nn.ReLU(inplace=True),
-            nn.Linear(256, 64),
-            nn.ReLU(inplace=True),
-            nn.Linear(64, 1),
-        )
-
-    def forward(self, z):
-        return self.net(z).squeeze(-1)
-
-
-class EmbeddingRaterMedium(nn.Module):
-    """Medium-capacity MLP rater for a ResNet-50 pooled embedding."""
-
-    def __init__(self, input_dim=2048):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.LayerNorm(input_dim),
-            nn.Linear(input_dim, 512),
-            nn.GELU(),
-            nn.Dropout(0.1),
-            nn.Linear(512, 256),
-            nn.GELU(),
-            nn.Dropout(0.1),
-            nn.Linear(256, 64),
-            nn.GELU(),
-            nn.Linear(64, 1),
-        )
-
-    def forward(self, z):
-        return self.net(z).squeeze(-1)
-
-
-# ============================================================
-# Inner classifier
-# ============================================================
-
-class InnerLinearClassifier(nn.Module):
-    """Linear classifier operating on frozen embeddings."""
-
-    def __init__(self, input_dim, num_classes):
-        super().__init__()
-        self.linear = nn.Linear(input_dim, num_classes)
-
-    def forward(self, z):
-        return self.linear(z)
+# Rater architectures and the inner classifier live in rater_models.py.
 
 
 # ============================================================
@@ -755,6 +736,39 @@ class Rater(Algorithm):
         self.save_plot_data = False
 
         self.save_freq = int(getattr(self.config, "save_freq", 0))
+
+        # ----------------------------------------------------
+        # Optional controls and diagnostics. All are OFF by default, so
+        # existing notebook runs keep exactly the previous behaviour.
+        # ----------------------------------------------------
+        # Uniform reference heads: same init and batches as each inner head,
+        # trained with a constant weight equal to the batch-mean rater weight
+        # (same total weight mass), never back-propagating into the rater.
+        self.uniform_reference = _env_flag("RATER_UNIFORM_REFERENCE")
+        # Staggered re-initialization of the inner heads every K meta steps
+        # (0 = never, the previous behaviour). The legacy --rater_refresh_steps
+        # flag is still parsed but deliberately not used, to keep old runs intact.
+        self.refresh_every = int(os.environ.get("RATER_REFRESH_STEPS", "0"))
+        # Which rater checkpoint to export:
+        #   min_outer_loss (previous behaviour), last, or fresh_heads
+        #   (outer objective of freshly initialized heads trained for a fixed
+        #   budget with the current rater; not confounded by inner-head age).
+        self.selection_rule = os.environ.get("RATER_SELECTION", "min_outer_loss").strip().lower()
+        self.fresh_head_epochs = int(os.environ.get("RATER_FRESH_HEAD_EPOCHS", "1"))
+        self.fresh_head_eval = (_env_flag("RATER_FRESH_HEAD_EVAL")
+                                or self.selection_rule == "fresh_heads")
+        # Meta-set (D_meta) options: an explicit outer split (e.g. a held-out
+        # part of train) and a cap on its size for size sweeps.
+        self.outer_split_override = os.environ.get("RATER_OUTER_SPLIT", "").strip()
+        self.outer_max_samples = int(os.environ.get("RATER_OUTER_MAX_SAMPLES", "0"))
+        if self.selection_rule not in {"min_outer_loss", "last", "fresh_heads"}:
+            raise ValueError("RATER_SELECTION must be min_outer_loss, last or fresh_heads.")
+        if self.refresh_every < 0 or self.fresh_head_epochs < 1 or self.outer_max_samples < 0:
+            raise ValueError("RATER_REFRESH_STEPS/RATER_OUTER_MAX_SAMPLES must be >= 0 and "
+                             "RATER_FRESH_HEAD_EPOCHS >= 1.")
+        self.reference_models = []
+        self._embedding_extract_seconds = 0.0
+        self._prev_snapshot_weights = {}
         if min(self.meta_steps, self.eval_freq, self.plot_freq) < 1:
             raise ValueError("Training length and evaluation/plot frequencies must be positive.")
 
@@ -864,7 +878,7 @@ class Rater(Algorithm):
         )
 
         representation_tag = (
-            f"{backbone_name}_waterbirds_erm_"
+            f"{backbone_name}_{dataset_name}_erm_"
             f"{self.erm_checkpoint_fingerprint}"
         )
 
@@ -915,8 +929,10 @@ class Rater(Algorithm):
             ),
             "feature_dim": int(self.feature_dim),
             "n_classes": int(self.n_classes),
+            # "<dataset>_erm_checkpoint"; unchanged ("waterbirds_erm_checkpoint")
+            # for existing Waterbirds caches.
             "representation_source": (
-                "waterbirds_erm_checkpoint"
+                f"{getattr(self.config, 'dataset', '')}_erm_checkpoint"
             ),
             "erm_checkpoint_path": os.path.abspath(
                 self.erm_model_path
@@ -1103,6 +1119,7 @@ class Rater(Algorithm):
             f"{self.config.backbone}..."
         )
 
+        extract_started = time.monotonic()
         # Cache order must be stable for per-sample trajectories and Grad-CAM IDs.
         loader = DataLoader(self.datasets[split], batch_size=self.config.batch_size,
                             shuffle=False, num_workers=self.config.num_workers)
@@ -1156,6 +1173,7 @@ class Rater(Algorithm):
             "[Rater embeddings] Future runs will load this file "
             "directly and will NOT extract this split again."
         )
+        self._embedding_extract_seconds += time.monotonic() - extract_started
 
         return EmbeddingTensorDataset(
             embeddings,
@@ -1183,6 +1201,8 @@ class Rater(Algorithm):
             "test",
             "train_subset1",
             "train_subset2",
+            "train_no_aug_subset1",
+            "train_no_aug_subset2",
             "val_subset1",
             "val_subset2",
         ]
@@ -1211,6 +1231,12 @@ class Rater(Algorithm):
                 f"{split} -> {len(dataset)} samples"
             )
 
+        _write_json(os.path.join(cache_dir, "_EXTRACTION_COMPUTE.json"), {
+            "splits": available,
+            "embedding_extraction_seconds": self._embedding_extract_seconds,
+            "note": "0 means every split was already cached.",
+            **_device_compute_info(),
+        })
         ready_file = os.path.join(cache_dir, "_READY.txt")
 
         with open(ready_file, "w") as f:
@@ -1281,6 +1307,31 @@ class Rater(Algorithm):
             f"||dW||={dw:.6f}, ||db||={db:.6f}. "
             "ERM classifier initialization is NOT used."
         )
+        # Uniform reference heads start from the SAME initialization.
+        self.reference_models = (
+            [copy.deepcopy(m) for m in self.inner_models]
+            if self.uniform_reference else []
+        )
+
+    def _maybe_refresh_inner_models(self, step):
+        """Staggered re-initialization (DataRater-style) when RATER_REFRESH_STEPS > 0.
+
+        Head i is re-created at steps where (step - 1) % K == i * K // M, never at
+        step 1. Its uniform reference head (if any) restarts from the same weights.
+        """
+        if self.refresh_every <= 0 or step <= 1:
+            return []
+        refreshed = []
+        position = (step - 1) % self.refresh_every
+        for index in range(len(self.inner_models)):
+            if position == index * self.refresh_every // len(self.inner_models):
+                self.inner_models[index] = self._new_inner_model(model_index=index)
+                if self.reference_models:
+                    self.reference_models[index] = copy.deepcopy(self.inner_models[index])
+                refreshed.append(index)
+        if refreshed:
+            self._meta_log(f"[META {step:04d}] re-initialized inner heads {refreshed}")
+        return refreshed
 
     @staticmethod
     def _next_batch(iterator, loader):
@@ -1576,6 +1627,11 @@ class Rater(Algorithm):
         )
 
         last_raw_scores = None
+        # Diagnostics only (detached); they never enter the meta-gradient.
+        weight_sum = weight_sq_sum = weight_xlogx_sum = 0.0
+        weight_count = 0
+        weighted_loss_total = 0.0
+        recorded_batches = [] if self.uniform_reference else None
 
         for _ in range(self.inner_steps):
             batch, train_iterator = self._next_batch(
@@ -1612,6 +1668,16 @@ class Rater(Algorithm):
                 per_sample_loss * weights
             ).sum()
 
+            with torch.no_grad():
+                w = weights.detach().double()
+                weight_sum += float(w.sum())
+                weight_sq_sum += float((w * w).sum())
+                weight_xlogx_sum += float((w * torch.log(w.clamp_min(1e-12))).sum())
+                weight_count += int(w.numel())
+                weighted_loss_total += float(inner_loss.detach())
+                if recorded_batches is not None:
+                    recorded_batches.append((z.detach(), y.detach(), float(w.mean())))
+
             if self.inner_reg_weight > 0:
                 inner_loss = (
                     inner_loss
@@ -1638,6 +1704,22 @@ class Rater(Algorithm):
             )
 
             last_raw_scores = raw_scores
+
+        # ESS fraction = (sum w)^2 / (n sum w^2) in (0, 1]; normalized entropy of
+        # w / sum(w) in [0, 1]. Both use the weights of the whole inner epoch.
+        if weight_count > 1 and weight_sum > 0:
+            ess_fraction = weight_sum ** 2 / (weight_count * weight_sq_sum)
+            entropy = math.log(weight_sum) - weight_xlogx_sum / weight_sum
+            entropy_normalized = entropy / math.log(weight_count)
+        else:
+            ess_fraction = entropy_normalized = float("nan")
+        self._last_inner_unroll = {
+            "weighted_inner_loss_per_batch": weighted_loss_total / max(self.inner_steps, 1),
+            "mean_weight": weight_sum / max(weight_count, 1),
+            "weight_ess_fraction": ess_fraction,
+            "weight_entropy_normalized": entropy_normalized,
+            "batches": recorded_batches,
+        }
 
         return (
             {
@@ -1856,8 +1938,10 @@ class Rater(Algorithm):
         outer_values = []
         committed_fast_params = []
         per_model_outer_stats = []
+        per_model_unroll = []
+        reference_values = []
 
-        for inner_model in self.inner_models:
+        for model_index, inner_model in enumerate(self.inner_models):
             (
                 fast_params,
                 train_iterator,
@@ -1929,6 +2013,12 @@ class Rater(Algorithm):
                 float(outer_loss.detach().item())
             )
             per_model_outer_stats.append(outer_stats)
+            unroll_stats = dict(self._last_inner_unroll)
+            recorded_batches = unroll_stats.pop("batches")
+            per_model_unroll.append(unroll_stats)
+            if self.reference_models:
+                reference_values.append(self._train_uniform_reference(
+                    self.reference_models[model_index], recorded_batches, val_loader))
 
             committed_fast_params.append(
                 {
@@ -1939,13 +2029,34 @@ class Rater(Algorithm):
 
         if any(p.grad is not None and not torch.isfinite(p.grad).all() for p in self.rater.parameters()):
             raise RuntimeError("Nonfinite rater gradient; checkpoint update aborted.")
+        grads = [p.grad.detach() for p in self.rater.parameters() if p.grad is not None]
         if self.grad_clip > 0:
-            torch.nn.utils.clip_grad_norm_(
+            # clip_grad_norm_ returns the total norm BEFORE clipping.
+            grad_norm_preclip = float(torch.nn.utils.clip_grad_norm_(
                 self.rater.parameters(),
                 self.grad_clip,
-            )
+            ))
+        else:
+            grad_norm_preclip = float(torch.norm(torch.stack([g.norm() for g in grads]))) if grads else 0.0
+        params_before = [p.detach().clone() for p in self.rater.parameters()]
 
         self.outer_optimizer.step()
+
+        with torch.no_grad():
+            update_norm = float(torch.sqrt(sum(
+                ((p.detach() - before) ** 2).sum()
+                for p, before in zip(self.rater.parameters(), params_before)
+            )))
+        self._last_meta_diagnostics = {
+            "rater_grad_norm_preclip": grad_norm_preclip,
+            "rater_grad_clipped": bool(self.grad_clip > 0 and grad_norm_preclip > self.grad_clip),
+            "rater_update_norm": update_norm,
+            **{key: float(np.mean([s[key] for s in per_model_unroll]))
+               for key in ("weighted_inner_loss_per_batch", "mean_weight",
+                           "weight_ess_fraction", "weight_entropy_normalized")},
+            "reference_outer_loss": (float(np.mean(reference_values))
+                                     if reference_values else float("nan")),
+        }
 
         with torch.no_grad():
             for inner_model, fast_params in zip(
@@ -1972,6 +2083,79 @@ class Rater(Algorithm):
             train_iterator,
             iter(val_loader),
         )
+
+    @torch.no_grad()
+    def _outer_objective_of(self, model, val_loader):
+        """Unweighted outer objective of a classifier on the full outer split (no graph)."""
+        losses, labels, groups = [], [], []
+        model.eval()
+        for z_outer, y_outer, group_outer, _ in val_loader:
+            z_outer = z_outer.to(self.device, non_blocking=True)
+            y_outer = y_outer.to(self.device, non_blocking=True)
+            losses.append(F.cross_entropy(model(z_outer), y_outer, reduction="none"))
+            labels.append(y_outer)
+            groups.append(group_outer.to(self.device, non_blocking=True).reshape(-1))
+        objective, _ = self._compute_outer_objective(
+            per_sample_losses=torch.cat(losses), labels=torch.cat(labels), groups=torch.cat(groups))
+        return float(objective)
+
+    def _train_uniform_reference(self, model, batches, val_loader):
+        """One inner epoch on the SAME batches as its rater-weighted twin.
+
+        Every sample gets the batch-mean rater weight, so the total weight mass
+        (effective step size) matches and only the distribution of weights differs.
+        """
+        for z, y, mean_weight in batches:
+            logits = model(z)
+            loss = mean_weight * F.cross_entropy(logits, y, reduction="none").sum()
+            if self.inner_reg_weight > 0:
+                loss = loss + self.inner_reg_weight * sum(p.pow(2).sum() for p in model.parameters())
+            grads = torch.autograd.grad(loss, list(model.parameters()))
+            with torch.no_grad():
+                for p, g in zip(model.parameters(), grads):
+                    p.sub_(self.inner_lr * g)
+        return self._outer_objective_of(model, val_loader)
+
+    def _fresh_head_objective(self, train_dataset, outer_dataset):
+        """Label-free rater score not confounded by the age of the persistent heads.
+
+        M freshly initialized linear heads (fixed init seeds, fixed batch order) are
+        trained for RATER_FRESH_HEAD_EPOCHS epochs with the CURRENT rater's weights
+        (eval mode, no meta-gradient), using the same inner procedure; returns the
+        mean outer objective on the outer split. Global RNG state is preserved.
+        """
+        rater_was_training = self.rater.training
+        self.rater.eval()
+        values = []
+        try:
+            with _preserve_rng():
+                outer_loader = DataLoader(outer_dataset, batch_size=self.config.batch_size,
+                                          shuffle=False, num_workers=0)
+                for index in range(len(self.inner_models)):
+                    torch.manual_seed(int(self.config.seed) * 1000 + 7919 + index)
+                    head = InnerLinearClassifier(self.feature_dim, self.n_classes).to(self.device)
+                    generator = torch.Generator().manual_seed(int(self.config.seed) * 1000 + 104729 + index)
+                    loader = DataLoader(train_dataset, batch_size=self.config.batch_size,
+                                        shuffle=True, generator=generator, num_workers=0)
+                    for _ in range(self.fresh_head_epochs):
+                        head.train()
+                        for z, y, _, _ in loader:
+                            z = z.to(self.device, non_blocking=True)
+                            y = y.to(self.device, non_blocking=True)
+                            with torch.no_grad():
+                                weights = self._scores_to_weights(self.rater(z))
+                            loss = (F.cross_entropy(head(z), y, reduction="none") * weights).sum()
+                            if self.inner_reg_weight > 0:
+                                loss = loss + self.inner_reg_weight * sum(
+                                    p.pow(2).sum() for p in head.parameters())
+                            grads = torch.autograd.grad(loss, list(head.parameters()))
+                            with torch.no_grad():
+                                for p, g in zip(head.parameters(), grads):
+                                    p.sub_(self.inner_lr * g)
+                    values.append(self._outer_objective_of(head, outer_loader))
+        finally:
+            self.rater.train(rater_was_training)
+        return float(np.mean(values))
 
     # ========================================================
     # Evaluation helpers
@@ -2764,7 +2948,14 @@ class Rater(Algorithm):
                 "outer_lse_beta": self.outer_lse_beta,
                 "calibration_size": len(datasets["val"]),
                 "inner_initialization": "independent_random_linear",
+                "uniform_reference": self.uniform_reference,
+                "refresh_every": self.refresh_every,
+                "selection_rule": self.selection_rule,
+                "fresh_head_epochs": self.fresh_head_epochs if self.fresh_head_eval else None,
+                "outer_split_override": self.outer_split_override or None,
+                "outer_max_samples": self.outer_max_samples or None,
             },
+            "provenance": _source_provenance(),
             "metric_definition": {
                 "accuracy": "fraction correct",
                 "worst_group_accuracy": "minimum accuracy over observed groups",
@@ -2815,8 +3006,9 @@ class Rater(Algorithm):
                                     phase="trajectory"):
         results = {}
         with _preserve_rng():
-            for i, model in enumerate(self.inner_models):
-                name = f"inner_{i}"
+            named = ([(f"inner_{i}", m) for i, m in enumerate(self.inner_models)]
+                     + [(f"reference_{i}", m) for i, m in enumerate(self.reference_models)])
+            for name, model in named:
                 results[name] = {}
                 for role, dataset in datasets.items():
                     result = self._evaluate_classifier(model, dataset)
@@ -2834,6 +3026,89 @@ class Rater(Algorithm):
             fig.savefig(os.path.join(plot_dir, f"{name}.png"), dpi=160)
             plt.close(fig)
 
+    def _save_population_curves(self, output_dir, best_step=None):
+        """Mean and min-max band over the heads of each population, per split.
+
+        Populations: inner (rater-weighted) and, if enabled, reference (uniform).
+        The selected meta step is marked when known.
+        """
+        rows = [r for r in self._metric_rows if r["phase"] == "trajectory"]
+        if not rows:
+            return
+        populations = sorted({r["model"].rsplit("_", 1)[0] for r in rows})
+        splits = sorted({r["split"] for r in rows})
+        fig, axes = plt.subplots(2, 2, figsize=(13, 8))
+        for ax, field, label in zip(axes.flat, METRIC_FIELDS, METRIC_LABELS):
+            for color_index, split_name in enumerate(splits):
+                color = f"C{color_index}"
+                for population in populations:
+                    by_step = defaultdict(list)
+                    for r in rows:
+                        if r["split"] == split_name and r["model"].rsplit("_", 1)[0] == population:
+                            by_step[int(r["step"])].append(float(r[field]))
+                    if not by_step:
+                        continue
+                    steps = sorted(by_step)
+                    values = [by_step[s] for s in steps]
+                    style = "-" if population == "inner" else "--"
+                    ax.plot(steps, [np.mean(v) for v in values], style, color=color,
+                            label=f"{split_name} ({population})")
+                    ax.fill_between(steps, [min(v) for v in values], [max(v) for v in values],
+                                    color=color, alpha=0.12)
+            if best_step is not None:
+                ax.axvline(best_step, color="k", linestyle=":", linewidth=1)
+            ax.set(xlabel="Meta step", ylabel=label)
+            ax.grid(alpha=0.25)
+            ax.legend(fontsize=7)
+        title = "Heads per split: mean and min–max (solid: rater-weighted, dashed: uniform reference)"
+        if best_step is not None:
+            title += f" (dotted line: selected step {best_step})"
+        fig.suptitle(title)
+        fig.tight_layout()
+        plot_dir = os.path.join(output_dir, "plots", "meta_metrics")
+        os.makedirs(plot_dir, exist_ok=True)
+        fig.savefig(os.path.join(plot_dir, "population.png"), dpi=160)
+        plt.close(fig)
+
+    def _save_selection_plot(self, history, best_step, output_dir):
+        """Outer objective per meta step, reference/fresh-head objectives, selected step."""
+        if not history:
+            return
+        steps = [r["step"] for r in history]
+        fig, axes = plt.subplots(1, 2, figsize=(14, 4.5))
+        ax = axes[0]
+        ax.plot(steps, [r["outer_loss"] for r in history], label="persistent rater-weighted heads")
+        reference = [r.get("reference_outer_loss", float("nan")) for r in history]
+        if any(math.isfinite(v) for v in reference):
+            ax.plot(steps, reference, "--", label="uniform reference heads")
+        fresh = getattr(self, "_fresh_head_history", [])
+        if fresh:
+            ax.plot([r["step"] for r in fresh], [r["fresh_head_outer_loss"] for r in fresh],
+                    "o-", markersize=3, label="fresh heads (fixed budget)")
+        for r in history:
+            if r.get("refreshed_heads"):
+                ax.axvline(r["step"], color="0.85", linewidth=0.8, zorder=0)
+        if best_step is not None:
+            ax.axvline(best_step, color="k", linestyle=":", label=f"selected step {best_step}")
+        ax.set(xlabel="Meta step", ylabel=f"{self.outer_loss_type} outer objective",
+               title=f"Rater selection ({self.selection_rule})")
+        ax.grid(alpha=0.25)
+        ax.legend(fontsize=8)
+        ax = axes[1]
+        for key, label in (("rater_grad_norm_preclip", "rater grad norm (pre-clip)"),
+                           ("rater_update_norm", "rater update norm"),
+                           ("weight_ess_fraction", "weight ESS fraction")):
+            values = [r.get(key, float("nan")) for r in history]
+            ax.plot(steps, values, label=label)
+        if self.grad_clip > 0:
+            ax.axhline(self.grad_clip, color="r", linestyle="--", linewidth=0.8, label="clip threshold")
+        ax.set(xlabel="Meta step", yscale="log", title="Meta-update diagnostics")
+        ax.grid(alpha=0.25)
+        ax.legend(fontsize=8)
+        fig.tight_layout()
+        fig.savefig(os.path.join(output_dir, "plots", "meta_selection.png"), dpi=160)
+        plt.close(fig)
+
     def _score_snapshot(self, output_dir, step, role, split_name, dataset, phase="trajectory"):
         """Reuse the existing histogram/scatter/box/ECDF plots; save their inputs once."""
         relationship = self._score_loss_relationship(dataset)
@@ -2849,6 +3124,18 @@ class Rater(Algorithm):
         np.savez_compressed(os.path.join(data_dir, f"{phase}_{step:06d}_{split_name}.npz"), **arrays)
         correlations = {k: v for k, v in relationship.items()
                         if k.startswith(("spearman", "pearson"))}
+        weights_now = relationship["final_scores"]
+        previous = self._prev_snapshot_weights.get((phase, role))
+        stability = float("nan")
+        if previous is not None and len(previous) == len(weights_now) \
+                and np.std(previous) > 0 and np.std(weights_now) > 0:
+            stability = float(stats.spearmanr(previous, weights_now).statistic)
+        self._prev_snapshot_weights[(phase, role)] = weights_now.copy()
+        total = float(weights_now.sum())
+        correlations["spearman_weights_vs_previous_snapshot"] = stability
+        correlations["weight_ess_fraction"] = (
+            total ** 2 / (len(weights_now) * float((weights_now ** 2).sum()))
+            if len(weights_now) and total > 0 else float("nan"))
         _append_csv(_diagnostic_path(output_dir, "score_correlations.csv"), [
             {"seed": self.config.seed, "stage": "meta", "phase": phase, "step": step,
              "split": split_name, "role": role, **correlations}
@@ -2876,6 +3163,7 @@ class Rater(Algorithm):
             "schema_version": 2, "stage": "meta", "step": step,
             "rater_sd": _cpu_state(self.rater),
             "inner_model_sds": [_cpu_state(m) for m in self.inner_models],
+            "reference_model_sds": [_cpu_state(m) for m in self.reference_models],
             "outer_optimizer_sd": copy.deepcopy(self.outer_optimizer.state_dict()),
             "rng_state": _rng_state(), "run_metadata": self._run_metadata,
             "feature_dim": self.feature_dim, "num_classes": self.n_classes,
@@ -3461,13 +3749,29 @@ class Rater(Algorithm):
             self._precompute_shared_embeddings(output_dir)
             return
         inner_split, outer_split = self._resolve_meta_splits(split)
+        if self.outer_split_override:
+            # e.g. --train_split train_subset1 --split_train 0.8 with
+            # RATER_OUTER_SPLIT=train_no_aug_subset2: a skewed, train-like D_meta.
+            if self.outer_split_override in {inner_split, "test"}:
+                raise ValueError("RATER_OUTER_SPLIT must differ from the inner split and from test.")
+            outer_split = self.outer_split_override
         split_names = {"train": inner_split, "val": outer_split, "test": "test"}
         if self._has_ea_calibration_split() and "val_subset2" not in split_names.values():
             split_names["heldout_val"] = "val_subset2"
         cache_dir = self._resolve_embedding_cache_dir(output_dir)
+        embeddings_started = time.monotonic()
         by_split = {name: self._extract_embedding_dataset(name, cache_dir)
                     for name in dict.fromkeys(split_names.values())}
+        embeddings_seconds = time.monotonic() - embeddings_started
         datasets = {role: by_split[name] for role, name in split_names.items()}
+        if self.outer_max_samples and self.outer_max_samples < len(datasets["val"]):
+            # Fixed (seeded) subsample of D_meta for meta-set size sweeps.
+            full_outer = datasets["val"]
+            keep = np.sort(np.random.RandomState(int(self.config.seed)).choice(
+                len(full_outer), self.outer_max_samples, replace=False))
+            datasets["val"] = EmbeddingTensorDataset(
+                full_outer.embeddings[keep], full_outer.y_array[keep], full_outer.group_array[keep],
+                full_outer.confounder_array[keep], sample_indices=full_outer.sample_indices[keep])
         if any(len(dataset) == 0 for dataset in datasets.values()):
             raise ValueError("Cannot train or evaluate the rater on an empty split.")
         # Keep image-space diagnostics available without occupying meta-unroll GPU RAM.
@@ -3476,6 +3780,14 @@ class Rater(Algorithm):
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         self._start_artifacts(output_dir, split_names, datasets)
+        # Full-dataset indices of the split subsets (val_indexes1 = rows of the
+        # official validation set used as D_meta when --split_val < 1), for
+        # overlap checks against the final classifier's splits.
+        _write_json(_diagnostic_path(output_dir, "sample_indices", "full_split_indices.json"), {
+            key: np.asarray(self.datasets[key]).tolist()
+            for key in ("val_indexes1", "val_indexes2", "train_indexes1", "train_indexes2")
+            if key in self.datasets
+        })
         train_loader = DataLoader(datasets["train"], batch_size=self.config.batch_size,
                                   shuffle=True, num_workers=self.config.num_workers)
         outer_loader = DataLoader(datasets["val"], batch_size=self.config.batch_size,
@@ -3500,7 +3812,21 @@ class Rater(Algorithm):
         best_step = None
         checkpoint_dir = os.path.join(output_dir, "plots", "checkpoints")
         best_path = os.path.join(checkpoint_dir, "best_meta.pt")
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+        meta_started = time.monotonic()
+        self._fresh_head_history = []
+        if self.fresh_head_eval:
+            fresh_value = self._fresh_head_objective(datasets["train"], datasets["val"])
+            self._fresh_head_history.append({"step": 0, "fresh_head_outer_loss": fresh_value})
+            self._meta_log(f"[META 0000] fresh-head {self.outer_loss_type}={fresh_value:.6f} (initial rater)")
+            if self.selection_rule == "fresh_heads":
+                best_outer_loss, best_step = fresh_value, 0
+                _atomic_torch_save({**self._checkpoint_payload(0), "best_meta_step": 0,
+                                    "best_outer_loss": fresh_value,
+                                    "checkpoint_kind": "initial_rater_fresh_head_selection"}, best_path)
         for step in tqdm(range(1, self.meta_steps + 1), desc="Rater full-epoch meta-training"):
+            refreshed = self._maybe_refresh_inner_models(step)
             # Associate each measured outer loss with the rater that produced it.
             candidate_rater = _cpu_state(self.rater)
             candidate_optimizer = copy.deepcopy(self.outer_optimizer.state_dict())
@@ -3508,8 +3834,17 @@ class Rater(Algorithm):
                 train_iterator, outer_iterator, train_loader, outer_loader)
             if not math.isfinite(outer_loss):
                 raise RuntimeError(f"Nonfinite meta objective at step {step}.")
+            should_eval = step == 1 or step % self.eval_freq == 0 or step == self.meta_steps
+            should_plot = step == 1 or step % self.plot_freq == 0 or step == self.meta_steps
+            fresh_value = float("nan")
+            if self.fresh_head_eval and should_eval:
+                fresh_value = self._fresh_head_objective(datasets["train"], datasets["val"])
+                self._fresh_head_history.append({"step": step, "fresh_head_outer_loss": fresh_value})
             row = {"step": step, "outer_loss": outer_loss,
-                   "elapsed_seconds": time.monotonic() - self._run_started}
+                   "elapsed_seconds": time.monotonic() - self._run_started,
+                   **self._last_meta_diagnostics,
+                   "fresh_head_outer_loss": fresh_value,
+                   "refreshed_heads": " ".join(str(i) for i in refreshed)}
             history.append(row)
             _append_csv(_diagnostic_path(output_dir, "meta_history.csv"), [row])
             with open(_diagnostic_path(output_dir, "outer_objective_details.jsonl"), "a", encoding="utf-8") as fout:
@@ -3518,20 +3853,27 @@ class Rater(Algorithm):
             latest = self._checkpoint_payload(step)
             latest.update(meta_step=step, outer_loss=outer_loss,
                           loss_timing="before_rater_optimizer_update")
-            if outer_loss < best_outer_loss:
+            if self.selection_rule == "min_outer_loss" and outer_loss < best_outer_loss:
                 best_outer_loss, best_step = outer_loss, step
                 selected = {**latest, "rater_sd": candidate_rater,
                             "outer_optimizer_sd": candidate_optimizer,
                             "best_meta_step": step, "best_outer_loss": outer_loss,
                             "checkpoint_kind": "selected_pre_update_rater_with_committed_inner_models"}
                 _atomic_torch_save(selected, best_path)
+            if (self.selection_rule == "last"
+                    or (self.selection_rule == "fresh_heads" and math.isfinite(fresh_value)
+                        and fresh_value < best_outer_loss)):
+                best_outer_loss = outer_loss if self.selection_rule == "last" else fresh_value
+                best_step = step
+                kind = ("last_post_update_rater" if self.selection_rule == "last"
+                        else "post_update_rater_fresh_head_selection")
+                _atomic_torch_save({**latest, "best_meta_step": step, "best_outer_loss": best_outer_loss,
+                                    "checkpoint_kind": kind}, best_path)
             latest.update(best_meta_step=best_step, best_outer_loss=best_outer_loss,
                           checkpoint_kind="latest_after_optimizer_update")
             _atomic_torch_save(latest, os.path.join(checkpoint_dir, "latest_meta.pt"))
             if self.save_freq > 0 and step % self.save_freq == 0:
                 _atomic_torch_save(latest, os.path.join(checkpoint_dir, f"meta_{step:06d}.pt"))
-            should_eval = step == 1 or step % self.eval_freq == 0 or step == self.meta_steps
-            should_plot = step == 1 or step % self.plot_freq == 0 or step == self.meta_steps
             if should_eval or should_plot:
                 self._evaluate_inner_diagnostics(output_dir, step, datasets, split_names)
             if should_plot:
@@ -3539,12 +3881,26 @@ class Rater(Algorithm):
                     self._score_snapshot(output_dir, step, role, split_names[role], dataset)
                 self._save_metric_curves(output_dir)
                 self._save_meta_training_curves(history, self._group_rows, output_dir)
+                self._save_population_curves(output_dir)
+        meta_seconds = time.monotonic() - meta_started
         selected = torch.load(best_path, map_location="cpu", weights_only=False)
         self.rater.load_state_dict(selected["rater_sd"])
         self.outer_optimizer.load_state_dict(selected["outer_optimizer_sd"])
         for model, state in zip(self.inner_models, selected["inner_model_sds"]):
             model.load_state_dict(state)
+        for model, state in zip(self.reference_models, selected.get("reference_model_sds", [])):
+            model.load_state_dict(state)
         self.rater.eval()
+        # min_outer_loss keeps the PRE-update rater of the best step, so step 1
+        # is the initial, never-updated rater; fresh_heads step 0 likewise.
+        selected_is_initial = ((self.selection_rule == "min_outer_loss" and best_step == 1)
+                               or best_step == 0)
+        compute = {"embedding_load_or_extract_seconds": embeddings_seconds,
+                   "embedding_extraction_seconds": self._embedding_extract_seconds,
+                   "meta_training_seconds": meta_seconds,
+                   "meta_training_note": "includes the periodic diagnostics and fresh-head evaluations",
+                   **_device_compute_info()}
+        provenance = _source_provenance()
         # Preserve the standalone notebook's checkpoint contract and keep it compact.
         export = {
             "rater_sd": _cpu_state(self.rater), "meta_steps": self.meta_steps,
@@ -3573,6 +3929,12 @@ class Rater(Algorithm):
             "inner_lr": self.inner_lr, "outer_lr": self.outer_lr,
             "erm_model_path": self.erm_model_path, "erm_fingerprint": self.erm_checkpoint_fingerprint,
             "erm_epoch": self.erm_checkpoint_epoch,
+            "selection_rule": self.selection_rule,
+            "selected_is_initial_rater": selected_is_initial,
+            "refresh_every": self.refresh_every, "uniform_reference": self.uniform_reference,
+            "outer_split": split_names["val"], "outer_size": len(datasets["val"]),
+            "dataset": getattr(self.config, "dataset", None), "seed": int(self.config.seed),
+            "compute": compute, "provenance": provenance,
         }
         _atomic_torch_save(export, os.path.join(output_dir, "final_rater.pt"))
         self._selected_inner_metrics = self._evaluate_inner_diagnostics(
@@ -3581,9 +3943,13 @@ class Rater(Algorithm):
             self._score_snapshot(output_dir, best_step, role, split_names[role], dataset, phase="selected")
         self._save_gradcam(output_dir, "selected", split_names.values(),
                            {"rater": self.rater, **{f"inner_{i}": m for i, m in enumerate(self.inner_models)}})
+        self._save_selection_plot(history, best_step, output_dir)
+        self._save_population_curves(output_dir, best_step)
         summary = {
             "seed": self.config.seed, "status": "complete", "stage": "meta",
             "best_meta_step": best_step, "best_outer_loss": best_outer_loss,
+            "selection_rule": self.selection_rule, "selected_is_initial_rater": selected_is_initial,
+            "compute": compute, "provenance": provenance,
             "calibration_size": len(datasets["val"]),
             "initial_inner_metrics": initial, "selected_inner_metrics": self._selected_inner_metrics,
             "elapsed_seconds": time.monotonic() - self._run_started, "split_names": split_names,
@@ -3596,9 +3962,15 @@ class Rater(Algorithm):
                       "Selected inner heads match the selected rater's meta step."],
         }
         _write_json(_diagnostic_path(output_dir, "summary.json"), summary)
+        if selected_is_initial:
+            self._meta_log("[Rater] WARNING: exported rater = initial (untrained) rater; see summary.txt.")
         lines = ["RATER META-LEARNING SUMMARY", f"Seed: {self.config.seed}",
                  f"Splits: {split_names}", f"Calibration samples: {summary['calibration_size']}",
-                 f"Selected meta step: {best_step}; outer loss: {best_outer_loss:.6f}", ""]
+                 f"Selected meta step: {best_step} (rule: {self.selection_rule}); "
+                 f"selection value: {best_outer_loss:.6f}", ""]
+        if selected_is_initial:
+            lines[-1:-1] = ["WARNING: the exported rater is the INITIAL, never-updated rater. "
+                            "Results with it measure an untrained network."]
         for name, by_split in self._selected_inner_metrics.items():
             for role, metrics in by_split.items():
                 lines.append(f"{name}/{role}: " + ", ".join(
@@ -3654,6 +4026,7 @@ def plot_run_comparison(run_dirs, output_dir, comparison):
         if comparison == "calibration_size":
             settings.pop("calibration_size", None)
             settings.pop("split_val", None)
+            settings.pop("outer_max_samples", None)
         if references is not None and settings != references:
             raise ValueError("Comparison runs differ in settings beyond the requested variable and seed.")
         references = settings
