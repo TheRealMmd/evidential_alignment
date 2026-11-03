@@ -5,7 +5,7 @@ best_meta_step == 1 under the min-outer-loss rule (the pre-update rater of
 step 1), or 0 under fresh-head selection / exported controls. Older checkpoints
 carry no 'selection_rule'; they used min_outer_loss.
 
-  python analysis/rater_inventory.py --root /content/drive/MyDrive/evidential_alignment_colab --out raters.csv
+  python analysis/rater_inventory.py --root /content/drive/MyDrive/FeatureRater --out raters.csv
 """
 
 import argparse

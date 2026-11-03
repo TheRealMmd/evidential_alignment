@@ -24,7 +24,7 @@ training group labels by design). `notebooks/Analysis/FeatureRater_TSNE_Visualiz
 t-SNE of the embeddings coloured by group and by rater weight.
 
 The notebooks run in Google Colab: they clone this repository, read/write a Google Drive folder
-(`evidential_alignment_colab/`), and pass rater settings through `RATER_*` environment variables.
+(`FeatureRater/`, see docs/DRIVE_LAYOUT.md), and pass rater settings through `RATER_*` environment variables.
 
 ## Repository layout
 
@@ -78,7 +78,7 @@ rates, uniform reference heads, head refresh, rater selection rule, D_meta optio
 `analysis/README.md`; all new options are off by default.
 
 ## Drive layout (experiment outputs)
-The notebooks read and write under `MyDrive/evidential_alignment_colab/`:
+The notebooks read and write under `MyDrive/FeatureRater/` (the old name `evidential_alignment_colab` also works):
 ```
 archives/                         dataset tarballs
 waterbirds/<ERM_ID>/              one folder per ERM backbone (e.g. erm-r50-e100-s0)

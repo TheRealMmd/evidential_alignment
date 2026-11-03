@@ -18,7 +18,7 @@ Colab example:
   python analysis/run_baselines.py --methods afr evidential_alignment dfr \
       --seeds 0 1 2 3 4 --erm-model "$ERM_MODEL" \
       --dataset-dir /content/datasets/waterbird_complete95_forest2water2 --patch-config \
-      --match-notebook-split fixed:0 --out-dir /content/drive/MyDrive/evidential_alignment_colab/baselines
+      --match-notebook-split fixed:0 --out-dir /content/drive/MyDrive/FeatureRater/waterbirds/erm-r50-e100-s0/baselines
 """
 
 import argparse

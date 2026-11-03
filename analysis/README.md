@@ -45,9 +45,10 @@ datasets work; Waterbirds caches keep their old names.
 ## Scripts
 ```bash
 cd /content/evidential_alignment
-D=/content/drive/MyDrive/evidential_alignment_colab
-CACHE=$D/embeddings_waterbirds_erm/waterbirds/resnet50_waterbirds_erm_1055b1e8de29/resolution_224
-ERM=$D/erm_base_models/waterbirds_erm_resnet50_imagenet_100ep_best_val_acc.pt
+D=/content/drive/MyDrive/FeatureRater          # or the old name, evidential_alignment_colab
+E=$D/waterbirds/erm-r50-e100-s0
+CACHE=$E/embeddings/waterbirds/resnet50_waterbirds_erm_1055b1e8de29/resolution_224
+ERM=$E/waterbirds_erm_resnet50_imagenet_100ep_best_val_acc.pt
 WB=/content/datasets/waterbird_complete95_forest2water2
 
 # Which raters were exported at step 1 (= untrained)?
@@ -55,7 +56,7 @@ python analysis/rater_inventory.py --root $D --out $D/tables/raters.csv
 
 # Untrained-rater control (3 init seeds), then run the multi-seed notebook on each
 for s in 0 1 2; do python analysis/export_init_rater.py --capacity medium --init-seed $s \
-  --erm-fingerprint 1055b1e8de29 --out $D/untrained_raters/medium_seed$s/final_rater.pt; done
+  --erm-fingerprint 1055b1e8de29 --out $E/raters/untrained_medium_seed$s/final_rater.pt; done
 
 # D_meta composition and overlap with the classifier's splits
 python analysis/meta_set_overlap.py --metadata $WB/metadata.csv \

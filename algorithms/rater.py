@@ -484,7 +484,7 @@ class Rater(Algorithm):
         # Preferred Colab usage:
         #
         #   RATER_EMBEDDING_CACHE_ROOT=
-        #       /content/drive/MyDrive/evidential_alignment_colab/embeddings
+        #       /content/drive/MyDrive/FeatureRater/waterbirds/<ERM_ID>/embeddings
         #
         # The Rater automatically creates a representation-specific
         # namespace under that root. The cache is independent of the
