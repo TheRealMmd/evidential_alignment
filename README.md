@@ -93,14 +93,14 @@ and the `--result_path` text file.
   `gradcam/selected/` (Grad-CAM of the selected rater and inner heads, one image per group and split)
 - `plots/checkpoints/`: `best_meta.pt`, `latest_meta.pt` (rater, inner heads, optimizer, RNG), optional `meta_<step>.pt`
 - Across runs: `python algorithms/rater.py --runs RUN... --output DIR` (mean ± std over seeds),
-  `--compare calibration_size` and `--compare initial_wga` (sensitivity to D_meta size and initial WGA).
+  `--compare calibration_size` (sensitivity to D_meta size).
 
 **Stage 2 (final classifier)**, in the experiment folder:
 - per seed (`seed_<s>/`): `plots/data/metrics.csv`, `group_metrics.csv`, `class_metrics.csv`,
   `history.csv`, `weight_stats.csv`; curves over epochs (`overall_`, `group_metrics_*`, `class_metrics_*`);
   weight histograms by group per epoch; `selection_results.csv` and `oracle_results.csv`;
   `selected_models/<rule>.pt` and `checkpoints/` (`by_selection/`, oracle, `latest.pt`); Grad-CAM of the
-  selected classifiers in `plots/gradcam/<rule>/` (cell 11, `ENABLE_GRADCAM`); `summary.json`/`summary.txt` (incl. elapsed time and peak GPU memory)
+  selected classifiers in `plots/gradcam/<rule>/` (cell 11, `ENABLE_GRADCAM`); `summary.json`/`summary.txt` (incl. elapsed time)
 - aggregate: `selection_results_all_seeds.csv`, `selection_metrics_mean_std.csv`, oracle files,
   `trajectory_metrics_mean_std.csv`, `aggregate_plots/` (curves and selection rules, mean ± std),
   `summary.txt`; `analysis/plot_final_classifier_multiseed.py` re-plots completed runs.

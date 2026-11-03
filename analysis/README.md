@@ -35,7 +35,6 @@ datasets work; Waterbirds caches keep their old names.
   **uniform-weight retraining** with the same protocol (weight 0.5 for every sample).
   Set `VARY_DATA_SPLIT_WITH_SEED` to the same value as the rater notebook (it is `True` here and
   `False` there by default) or the seeds cannot be paired.
-* All three multi-seed notebooks now record `peak_gpu_memory_bytes` and `gpu_name` per seed.
 * Untrained-rater control: export a rater at initialization and point `RATER_CHECKPOINT` at it.
 
 ## Scripts

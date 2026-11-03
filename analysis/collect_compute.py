@@ -1,5 +1,5 @@
 """Compute-cost table across stages: embedding extraction, rater meta-training,
-final classifier (per seed), and baselines.
+final classifier (per seed; wall clock only), and baselines.
 
   python analysis/collect_compute.py \
      --embedding-cache <cache>/resolution_224 \
