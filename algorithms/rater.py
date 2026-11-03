@@ -411,6 +411,37 @@ class Rater(Algorithm):
             ).hexdigest()[:12]
         )
 
+        # Optional pin for a checkpoint that was MOVED on Drive. The fingerprint
+        # above includes the file's path, so a moved checkpoint would otherwise
+        # get a new embedding-cache name and its caches would be rebuilt.
+        # RATER_ERM_FINGERPRINT keeps the original name; RATER_ERM_MD5 (optional)
+        # proves the file is the same checkpoint. Unset = previous behaviour.
+        pinned_fingerprint = os.environ.get("RATER_ERM_FINGERPRINT", "").strip().lower()
+        self.erm_fingerprint_pinned = bool(pinned_fingerprint)
+        if pinned_fingerprint:
+            if len(pinned_fingerprint) != 12 or any(
+                ch not in "0123456789abcdef" for ch in pinned_fingerprint
+            ):
+                raise ValueError("RATER_ERM_FINGERPRINT must be 12 hex characters.")
+            expected_md5 = os.environ.get("RATER_ERM_MD5", "").strip().lower()
+            if expected_md5:
+                digest = hashlib.md5()
+                with open(self.erm_model_path, "rb") as fin:
+                    for chunk in iter(lambda: fin.read(1 << 22), b""):
+                        digest.update(chunk)
+                if digest.hexdigest() != expected_md5:
+                    raise ValueError(
+                        "RATER_ERM_MD5 does not match the ERM checkpoint "
+                        f"{self.erm_model_path}; refusing to pin fingerprint "
+                        f"{pinned_fingerprint} to a different file."
+                    )
+            log(
+                f"[Rater] ERM fingerprint pinned to {pinned_fingerprint} "
+                f"(computed from the current path: {self.erm_checkpoint_fingerprint}; "
+                f"md5 {'verified' if expected_md5 else 'not checked'})."
+            )
+            self.erm_checkpoint_fingerprint = pinned_fingerprint
+
         self.feature_model.eval()
 
         for p in self.feature_model.parameters():
@@ -1038,6 +1069,10 @@ class Rater(Algorithm):
             return False
 
         for key, expected_value in expected.items():
+            # A pinned (moved) checkpoint has a new path by design; the pinned
+            # fingerprint, epoch and the other keys still have to match.
+            if key == "erm_checkpoint_path" and getattr(self, "erm_fingerprint_pinned", False):
+                continue
             if actual.get(key) != expected_value:
                 return False
 

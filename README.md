@@ -77,6 +77,24 @@ Stage 2 is the final-classifier notebook. Rater options (outer loss, weighting, 
 rates, uniform reference heads, head refresh, rater selection rule, D_meta options) are listed in
 `analysis/README.md`; all new options are off by default.
 
+## Drive layout (experiment outputs)
+The notebooks read and write under `MyDrive/evidential_alignment_colab/`:
+```
+archives/                         dataset tarballs
+waterbirds/<ERM_ID>/              one folder per ERM backbone (e.g. erm-r50-e100-s0)
+  <stable ERM checkpoint>.pt      + manifest, results, Evidential Alignment feature files
+  erm_..._pretrained/             the ERM training run
+  embeddings/waterbirds/resnet50_waterbirds_erm_<fingerprint>/resolution_224/
+  raters/<rater run>/             final_rater.pt, logs, plots
+    classifiers/<run>/            final classifiers trained with this rater
+  controls/<run>/                 no-rater controls (random, constant, minority weights)
+  baselines/  analysis/
+unsorted/                         older runs whose ERM or rater is not recorded
+```
+Each notebook sets `ERM_ID` and falls back to the pre-November paths when the new folders do not
+exist. A moved ERM checkpoint keeps its embedding cache through `RATER_ERM_FINGERPRINT` (+ `RATER_ERM_MD5`),
+set in the Train Rater notebook (`ERM_PINS`).
+
 ## What each stage saves
 
 **Stage 0 (ERM)**, in `<save_folder>/erm_<dataset>_resnet50_..._pretrained/`: `best_val_acc_model.pt`
