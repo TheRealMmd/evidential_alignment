@@ -51,8 +51,10 @@ if __name__ == "__main__":
         return lambda cls: cls
 
     from rater_models import EmbeddingRaterMedium, EmbeddingRaterSmall, InnerLinearClassifier
+    import erm_record
 else:
     from .rater_models import EmbeddingRaterMedium, EmbeddingRaterSmall, InnerLinearClassifier
+    from . import erm_record
     from .algorithm import Algorithm
     from .register import register_algorithm
     from models.classifier import Classifier
@@ -553,6 +555,11 @@ class Rater(Algorithm):
             "class_balanced",
             "worst_class_loss",
             "logsumexp",
+            # Added later; all use class labels only (no group labels).
+            "top_loss",
+            "worst_class_top_loss",
+            "classwise_logsumexp",
+            "mean_plus_std",
         }
         if self.outer_loss_type not in valid_outer_losses:
             raise ValueError(
@@ -595,6 +602,11 @@ class Rater(Algorithm):
         )
         if self.outer_lse_beta <= 0.0:
             raise ValueError("RATER_OUTER_LSE_BETA must be positive.")
+        # Used only by outer_loss=mean_plus_std: mean CE + coef * std of CE.
+        self.outer_std_coef = float(os.environ.get(
+            "RATER_OUTER_STD_COEF", str(getattr(self.config, "rater_outer_std_coef", 1.0))))
+        if self.outer_std_coef < 0.0:
+            raise ValueError("RATER_OUTER_STD_COEF must be >= 0.")
         self.temperature = float(
             os.environ.get(
                 "RATER_TEMPERATURE",
@@ -829,6 +841,8 @@ class Rater(Algorithm):
             f"LSE beta={self.outer_lse_beta:g}; "
             f"group labels used={uses_groups}."
         )
+        if self.outer_loss_type == "mean_plus_std":
+            log(f"[Rater] mean_plus_std coefficient = {self.outer_std_coef:g}")
         log(
             f"[Rater] Inner population = {self.num_inner_models}; "
             "both inner classifiers are initialized independently from scratch."
@@ -1182,6 +1196,16 @@ class Rater(Algorithm):
             attrs,
         )
 
+    def _erm_record(self, datasets_by_name, train_split):
+        """Evaluate the frozen ERM head on embedding datasets (reads tensors only)."""
+        return erm_record.build_record(
+            self.erm_head_weight, self.erm_head_bias,
+            {name: (d.embeddings, d.y_array, d.group_array) for name, d in datasets_by_name.items()},
+            train_split=train_split,
+            checkpoint={"path": self.erm_model_path, "fingerprint": self.erm_checkpoint_fingerprint,
+                        "epoch": self.erm_checkpoint_epoch, "sel_metric": self.erm_checkpoint_sel_metric},
+        )
+
     def _precompute_shared_embeddings(self, output_dir):
         """
         Build/validate all deterministic embeddings without meta-training.
@@ -1221,15 +1245,24 @@ class Rater(Algorithm):
             f"[Rater embeddings] Preparing splits: {available}"
         )
 
+        prepared = {}
         for split in available:
             dataset = self._extract_embedding_dataset(
                 split,
                 cache_dir,
             )
+            prepared[split] = dataset
             log(
                 f"[Rater embeddings] READY: "
                 f"{split} -> {len(dataset)} samples"
             )
+
+        # ERM record: the ERM checkpoint's own head on every cached split.
+        record = self._erm_record(prepared, train_split="train_no_aug")
+        erm_record.write_record(record, os.path.join(cache_dir, "ERM_RECORD.json"),
+                                os.path.join(cache_dir, "ERM_RECORD.csv"))
+        for line in erm_record.format_record(record):
+            log(line)
 
         _write_json(os.path.join(cache_dir, "_EXTRACTION_COMPUTE.json"), {
             "splits": available,
@@ -1739,6 +1772,7 @@ class Rater(Algorithm):
         self,
         per_sample_losses,
         labels,
+        reduce="mean",
     ):
         """
         Class-balanced hard-tail outer objective using CLASS labels only.
@@ -1811,9 +1845,14 @@ class Rater(Algorithm):
                 "Outer batch/split contained no labeled examples."
             )
 
-        outer_loss = torch.stack(
+        class_tail_means = torch.stack(
             class_tail_means
-        ).mean()
+        )
+        # reduce="max" (worst_class_top_loss) uses the worst class's tail mean.
+        outer_loss = (
+            class_tail_means.max() if reduce == "max"
+            else class_tail_means.mean()
+        )
 
         return outer_loss, stats
 
@@ -1874,6 +1913,41 @@ class Rater(Algorithm):
                 per_sample_losses,
                 labels,
             )
+
+        if self.outer_loss_type == "worst_class_top_loss":
+            return self._classwise_top_loss_outer_objective(
+                per_sample_losses, labels, reduce="max")
+
+        if self.outer_loss_type == "top_loss":
+            # CVaR over all outer examples: mean of the top p% losses, classes ignored.
+            n = int(per_sample_losses.numel())
+            k = min(n, max(1, int(math.ceil(self.outer_top_loss_fraction * n))))
+            tail = torch.topk(per_sample_losses, k=k, largest=True, sorted=False).values.mean()
+            return tail, {"sample_count": n, "k_selected": k,
+                          "tail_mean": float(tail.detach().item()),
+                          "mean_loss": float(per_sample_losses.detach().mean().item())}
+
+        if self.outer_loss_type == "mean_plus_std":
+            # Variance-regularized objective: mean CE + coef * (population) std of CE.
+            mean = per_sample_losses.mean()
+            std = per_sample_losses.std(unbiased=False)
+            return mean + self.outer_std_coef * std, {
+                "sample_count": int(per_sample_losses.numel()),
+                "mean_loss": float(mean.detach().item()), "std_loss": float(std.detach().item())}
+
+        if self.outer_loss_type == "classwise_logsumexp":
+            # Normalized log-sum-exp within each class, then the class values averaged equally.
+            beta = self.outer_lse_beta
+            class_values, stats = [], {}
+            for class_id_tensor in torch.unique(labels):
+                class_losses = per_sample_losses[labels.eq(class_id_tensor)]
+                value = (torch.logsumexp(beta * class_losses, dim=0)
+                         - math.log(class_losses.numel())) / beta
+                class_values.append(value)
+                stats[int(class_id_tensor.item())] = {
+                    "n_class": int(class_losses.numel()), "lse_value": float(value.detach().item()),
+                    "mean_loss": float(class_losses.detach().mean().item())}
+            return torch.stack(class_values).mean(), stats
 
         class_means = []
         stats = {}
@@ -3780,6 +3854,13 @@ class Rater(Algorithm):
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         self._start_artifacts(output_dir, split_names, datasets)
+        # ERM record for the splits this run uses (keyed by split name, e.g. val_subset1).
+        self._erm_record_data = self._erm_record(by_split, train_split=inner_split)
+        erm_record.write_record(self._erm_record_data,
+                                _diagnostic_path(output_dir, "erm_record.json"),
+                                _diagnostic_path(output_dir, "erm_record.csv"))
+        for line in erm_record.format_record(self._erm_record_data):
+            self._meta_log(line)
         # Full-dataset indices of the split subsets (val_indexes1 = rows of the
         # official validation set used as D_meta when --split_val < 1), for
         # overlap checks against the final classifier's splits.
@@ -3918,7 +3999,13 @@ class Rater(Algorithm):
                 "class_balanced": "equal_mean_of_per_class_mean_losses",
                 "worst_class_loss": "maximum_per_class_mean_loss",
                 "logsumexp": "normalized_logsumexp_over_all_examples",
+                "top_loss": "mean_of_top_tail_over_all_examples_cvar",
+                "worst_class_top_loss": "maximum_per_class_top_tail_mean",
+                "classwise_logsumexp": "equal_mean_of_per_class_normalized_logsumexp",
+                "mean_plus_std": "mean_ce_plus_coef_times_std_ce",
             }[self.outer_loss_type],
+            "outer_std_coef": self.outer_std_coef,
+            "erm_record": self._erm_record_data,
             "feature_dim": self.feature_dim, "num_classes": self.n_classes,
             "backbone": self.config.backbone, "rater_capacity": self.rater_capacity,
             "weighting": self.weighting, "temperature": self.temperature,

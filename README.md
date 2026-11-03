@@ -68,6 +68,11 @@ RATER_OUTER_LOSS=classwise_top_loss RATER_WEIGHTING=sigmoid RATER_TEMPERATURE=1.
   python main.py --dataset waterbirds --algorithm rater --backbone resnet50 --pretrained True \
   --erm_model $RATER_ERM_MODEL --split_val 0.4 --train_split train --epoch 500 --mode train --save_folder runs/rater
 ```
+Outer objectives (`RATER_OUTER_LOSS` / `OUTER_LOSS`). Class labels only: `classwise_top_loss` (default),
+`class_balanced`, `worst_class_loss`, `logsumexp`, `top_loss` (CVaR over all examples), `worst_class_top_loss`,
+`classwise_logsumexp`, `mean_plus_std` (mean + `RATER_OUTER_STD_COEF` × std), `standard_ce`. With group
+labels (reference rows only): `worst_group_loss`, `group_balanced_loss`.
+
 Stage 2 is the final-classifier notebook. Rater options (outer loss, weighting, temperature, learning
 rates, uniform reference heads, head refresh, rater selection rule, D_meta options) are listed in
 `analysis/README.md`; all new options are off by default.
@@ -78,9 +83,14 @@ rates, uniform reference heads, head refresh, rater selection rule, D_meta optio
 (used downstream), `best_val_{worst_cls_acc,worst_group_acc,avg_cls_diff}_model.pt`, `latest_model.pt`,
 `model_epoch<k>.pt` (every `--save_freq`), `erm_train_val_test_history.csv` (per-epoch metrics), `log.txt`,
 and the `--result_path` text file.
+Per-group results of the checkpoint used downstream are written in stage 1 (ERM record, below).
 
 **Stage 1 (rater)**, in the run folder:
-- `final_rater.pt` (rater weights + settings, selected step, compute, provenance), `summary.txt`, `log.txt`
+- `final_rater.pt` (rater weights + settings, selected step, compute, provenance, ERM record), `summary.txt`, `log.txt`
+- **ERM record** (how the frozen ERM checkpoint itself does: accuracy, WGA, average and adjusted average
+  accuracy, per-group and per-class accuracy, mean CE): `ERM_RECORD.json`/`.csv` next to the embedding
+  cache (every cached split; written by the embedding step), `plots/data/erm_record.{json,csv}` for the
+  splits the run uses, and a summary in `log.txt`
 - `plots/data/`: `metrics.csv` and `group_metrics.csv` (accuracy, WGA, loss, worst-group loss of every
   inner head on train / D_meta / held-out val / test over meta-steps), `meta_history.csv` (outer loss and
   meta-update diagnostics per step), `group_statistics.csv` (per-group weight statistics over time),

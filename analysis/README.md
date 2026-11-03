@@ -18,6 +18,10 @@ environment variables (cell 6 of `notebooks/Train Rater/Run_Rater_Classwise_Oute
 | `RATER_FRESH_HEAD_EVAL=1` | Log the fresh-head objective at every eval step without selecting by it. |
 | `RATER_OUTER_SPLIT=train_no_aug_subset2` | Use a held-out part of the (skewed) training set as D_meta. Run with `--split_train 0.8 --train_split train_subset1`. |
 | `RATER_OUTER_MAX_SAMPLES=N` | Seeded subsample of D_meta (meta-set size sweep; compare with `python algorithms/rater.py --runs ... --compare calibration_size`). |
+| `RATER_OUTER_LOSS=top_loss` | CVaR over all outer examples: mean of the top `RATER_OUTER_TOP_LOSS_PERCENT` losses, classes ignored. |
+| `RATER_OUTER_LOSS=worst_class_top_loss` | Worst class's top-loss tail mean (instead of the class average). |
+| `RATER_OUTER_LOSS=classwise_logsumexp` | Normalized log-sum-exp within each class (`RATER_OUTER_LSE_BETA`), classes averaged equally. |
+| `RATER_OUTER_LOSS=mean_plus_std` | Mean CE + `RATER_OUTER_STD_COEF` (default 1.0) × std of CE. |
 
 Always logged now: rater gradient norm before clipping, whether clipping fired, update norm,
 weighted inner loss, weight ESS fraction and normalized entropy (`meta_history.csv`); weight

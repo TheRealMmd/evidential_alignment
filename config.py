@@ -620,6 +620,10 @@ def rater_args(parser):
             "class_balanced",
             "worst_class_loss",
             "logsumexp",
+            "top_loss",
+            "worst_class_top_loss",
+            "classwise_logsumexp",
+            "mean_plus_std",
         ],
         help=(
             "outer objective used to update the Rater: standard CE, "
