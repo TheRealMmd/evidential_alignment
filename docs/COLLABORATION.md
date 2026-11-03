@@ -13,7 +13,7 @@ notebooks and the outputs in step.
 ## 2. Opening a notebook
 Open it from GitHub, not from a copy in your Drive:
 `https://colab.research.google.com/github/TheRealMmd/evidential_alignment/blob/<branch>/notebooks/<folder>/<name>.ipynb`
-(Colab: File › Open notebook › GitHub). The notebook clones the same branch, so code and notebook match.
+(Colab: File › Open notebook › GitHub). Set `REPO_BRANCH` in the notebook to the same branch, so code and notebook match.
 Each run records the commit it used in its outputs.
 
 First time only: in Drive, open the shared folder and choose *Add shortcut to Drive* → My Drive. Name the
@@ -25,11 +25,14 @@ change them in Colab and run. Do not save the notebook back. The run's `config.j
 so nothing is lost and nobody else is affected.
 
 **Structural changes** (code in `algorithms/` or `analysis/`, new or removed notebook cells, paths, the Drive
-layout, anything another person's run depends on):
-1. Make a branch (`<name>/<topic>`), change and test.
-2. Open a pull request; one of the other two reviews it.
-3. Merge to `main`, then tell the others to reopen their notebooks from `main`.
-4. Drive layout changes happen only after the code that understands them is merged, and only as moves
+layout, anything another person's run depends on). Work on a branch; we merge it into `main` ourselves, without
+pull requests:
+1. Say in the team chat what you are about to change, so two people don't edit the same notebook at once.
+2. Make a branch (`<name>/<topic>`), change and test (a short run is enough), commit and push the branch.
+3. Tell the others; anyone who needs the change opens the notebook from that branch (`REPO_BRANCH`).
+4. When the three of you agree it is ready: `git checkout main && git pull && git merge <branch> && git push`,
+   then point `REPO_BRANCH` back to `main`.
+5. Drive layout changes happen only after the code that understands them is pushed, and only as moves
    (never copies or deletes): the Drive has no spare space.
 
 `python tools/check_notebooks.py` checks that every notebook uses the same project-folder and layout code.
@@ -42,4 +45,5 @@ fill in the Drive folder and the numbers, and set `Done`. Two people never run t
 - Personal copies in "Colab Notebooks" (each person's own Drive): rename them with an `OLD ` prefix or move
   them into an `old notebooks` folder, and stop using them. They point to folders that moved on 3 Nov.
 - The notebooks removed from the repository in the cleanup stay in git history (`git log -- old_notebooks`).
-- Until the cleanup branch is merged, `main` still has notebooks with the old Drive paths; use the branch.
+- Until the cleanup branch (`station/featurerater-cleanup`) is merged, `main` still has notebooks with the old Drive
+  paths; use the branch.
