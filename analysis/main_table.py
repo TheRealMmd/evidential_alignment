@@ -45,21 +45,7 @@ def summarize(name, kind, rows, rule):
 def fmt(mean, std, n):
     if n == 0 or mean != mean:
         return "--"
-    return f"{100 * mean:.1f} $\\pm$ {100 * std:.1f}"
-
-
-def latex(rows, rule):
-    lines = [r"\begin{tabular}{lccc}", r"\toprule",
-             "Method & " + " & ".join(label for _, label in METRICS) + r" \\", r"\midrule"]
-    for r in rows:
-        cells = [fmt(r[f"{k}_mean"], r[f"{k}_std"], r[f"{k}_n"]) for k, _ in METRICS]
-        mark = "$^\\dagger$" if r["uses_val_group_labels"] else ""
-        lines.append(f"{r['method']}{mark} & " + " & ".join(cells) + r" \\")
-    lines += [r"\bottomrule", r"\end{tabular}",
-              f"% Selection rule: {rule}. Mean $\\pm$ std over seeds (n per cell in the CSV). "
-              "$^\\dagger$ uses validation group labels. Adj. avg. = test group accuracies weighted by "
-              "training group proportions; '--' where per-group results are unavailable."]
-    return "\n".join(lines) + "\n"
+    return f"{100 * mean:.1f} ± {100 * std:.1f}"
 
 
 def main():
@@ -68,7 +54,7 @@ def main():
     p.add_argument("--baseline", action="append", default=[], help="NAME=result file, folder or glob (repeatable)")
     p.add_argument("--rule", default="val_worst_class_accuracy")
     p.add_argument("--train-group-counts", type=int, nargs="+", default=list(WATERBIRDS_TRAIN_GROUP_COUNTS))
-    p.add_argument("--out", required=True, help="Output prefix (writes <out>.csv, <out>_per_seed.csv, <out>.tex)")
+    p.add_argument("--out", required=True, help="Output prefix (writes <out>.csv and <out>_per_seed.csv)")
     args = p.parse_args()
     if not args.exp and not args.baseline:
         p.error("pass at least one --exp or --baseline")
@@ -84,13 +70,12 @@ def main():
     out = Path(args.out)
     write_csv(out.with_suffix(".csv"), summary)
     write_csv(out.parent / (out.name + "_per_seed.csv"), per_seed)
-    out.with_suffix(".tex").write_text(latex(summary, args.rule), encoding="utf-8")
     for r in summary:
         def plain(key):
-            return fmt(r[f"{key}_mean"], r[f"{key}_std"], r[f"{key}_n"]).replace(" $\\pm$ ", " ± ")
+            return fmt(r[f"{key}_mean"], r[f"{key}_std"], r[f"{key}_n"])
         print(f"{r['method']:<28} WGA {plain('test_wga'):>13}  acc {plain('test_accuracy'):>13}  "
               f"seeds [{r['seeds']}]  split seeds [{r['split_seeds']}]")
-    print("wrote", out.with_suffix(".csv"), out.with_suffix(".tex"))
+    print("wrote", out.with_suffix(".csv"), out.parent / (out.name + "_per_seed.csv"))
 
 
 if __name__ == "__main__":

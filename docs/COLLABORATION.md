@@ -6,15 +6,16 @@ notebooks and the outputs in step.
 ## 1. One home for each kind of thing
 | What | Lives in | Never in |
 |---|---|---|
-| Code and notebooks | this GitHub repository | Drive, personal Colab copies |
+| Code and notebooks | this GitHub repository (copies of the notebooks are in Drive `FeatureRater/notebooks/`) | personal Colab copies |
 | Data and run outputs | the shared Drive folder (`FeatureRater/`, see DRIVE_LAYOUT.md) | the repository |
 | The plan and who runs what | the FeatureRater sheet (Rater / Classifier tabs) | chat threads |
 
 ## 2. Opening a notebook
-Open it from GitHub, not from a copy in your Drive:
+Double-click it in Drive `FeatureRater/notebooks/<stage>/` (opens in Colab), or open it from GitHub:
 `https://colab.research.google.com/github/TheRealMmd/evidential_alignment/blob/<branch>/notebooks/<folder>/<name>.ipynb`
 (Colab: File › Open notebook › GitHub). Set `REPO_BRANCH` in the notebook to the same branch, so code and notebook match.
-Each run records the commit it used in its outputs.
+The Drive copies can lag behind the repository, which is the source of truth; replace a copy when its notebook
+changes. Each run records the commit it used in its outputs.
 
 First time only: in Drive, open the shared folder and choose *Add shortcut to Drive* → My Drive. Name the
 shortcut `FeatureRater` (the old name also works).
@@ -34,8 +35,6 @@ pull requests:
    then point `REPO_BRANCH` back to `main`.
 5. Drive layout changes happen only after the code that understands them is pushed, and only as moves
    (never copies or deletes): the Drive has no spare space.
-
-`python tools/check_notebooks.py` checks that every notebook uses the same project-folder and layout code.
 
 ## 4. Claiming and recording runs
 Before you start a run, set its row in the sheet to `Running` with your name in *Owner*. When it finishes,

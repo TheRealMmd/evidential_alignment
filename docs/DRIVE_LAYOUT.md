@@ -8,6 +8,7 @@ Owner: Mohammad (`colab.mohammadian@gmail.com`). Name: `FeatureRater` (was `evid
 FeatureRater/
   archives/                         dataset tarballs
   code/                             (one legacy file; code belongs in the repo)
+  notebooks/<stage>/                copies of the repository's notebooks (Colab files)
   waterbirds/
     erm-r50-e100-s0/                ERM backbone 1055b1e8de29 (sheet: Backbone 1)
       waterbirds_erm_resnet50_imagenet_100ep_best_val_acc.pt   + manifest, results, EA feature files (*.npy)
