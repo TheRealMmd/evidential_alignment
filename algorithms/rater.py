@@ -532,7 +532,10 @@ class Rater(Algorithm):
             getattr(self.config, "rater_inner_steps", 2)
         )
         # Zero preserves the historical full-pass inner budget.
-        self.inner_batch_limit = int(os.environ.get("RATER_INNER_STEPS", "0"))
+        try:
+            self.inner_batch_limit = int(os.environ.get("RATER_INNER_STEPS", "0"))
+        except ValueError as exc:
+            raise ValueError("RATER_INNER_STEPS must be an integer >= 0 (0 = full training pass).") from exc
         self.step_diagnostics = _env_flag("RATER_STEP_DIAGNOSTICS")
         if self.inner_batch_limit < 0:
             raise ValueError("RATER_INNER_STEPS must be >= 0 (0 = full training pass).")
@@ -2051,7 +2054,7 @@ class Rater(Algorithm):
 
         For memory efficiency, each inner model's outer loss / num_models is
         backpropagated immediately. The Rater optimizer step happens only after
-        both inner models have completed their full inner epoch and outer loss.
+        both inner models have completed their configured minibatches and outer loss.
         """
         del val_iterator
 
