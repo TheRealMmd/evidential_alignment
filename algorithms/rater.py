@@ -531,6 +531,11 @@ class Rater(Algorithm):
         self.inner_steps = int(
             getattr(self.config, "rater_inner_steps", 2)
         )
+        # Zero preserves the historical full-pass inner budget.
+        self.inner_batch_limit = int(os.environ.get("RATER_INNER_STEPS", "0"))
+        self.step_diagnostics = _env_flag("RATER_STEP_DIAGNOSTICS")
+        if self.inner_batch_limit < 0:
+            raise ValueError("RATER_INNER_STEPS must be >= 0 (0 = full training pass).")
         self.num_inner_models = int(
             os.environ.get(
                 "RATER_NUM_INNER_MODELS",
@@ -1671,7 +1676,7 @@ class Rater(Algorithm):
         train_loader,
     ):
         """
-        Differentiable FULL-EPOCH Rater-weighted classifier optimization.
+        Differentiable Rater-weighted optimization for the resolved minibatch budget.
 
         On each batch, every sample receives a Rater rating.
 
@@ -1700,6 +1705,7 @@ class Rater(Algorithm):
         weight_count = 0
         weighted_loss_total = 0.0
         recorded_batches = [] if self.uniform_reference else None
+        train_loss_sum = train_correct = 0
 
         for _ in range(self.inner_steps):
             batch, train_iterator = self._next_batch(
@@ -1743,6 +1749,9 @@ class Rater(Algorithm):
                 weight_xlogx_sum += float((w * torch.log(w.clamp_min(1e-12))).sum())
                 weight_count += int(w.numel())
                 weighted_loss_total += float(inner_loss.detach())
+                if self.step_diagnostics:
+                    train_loss_sum += float(per_sample_loss.detach().sum())
+                    train_correct += int(logits.detach().argmax(dim=1).eq(y).sum())
                 if recorded_batches is not None:
                     recorded_batches.append((z.detach(), y.detach(), float(w.mean())))
 
@@ -1774,7 +1783,7 @@ class Rater(Algorithm):
             last_raw_scores = raw_scores
 
         # ESS fraction = (sum w)^2 / (n sum w^2) in (0, 1]; normalized entropy of
-        # w / sum(w) in [0, 1]. Both use the weights of the whole inner epoch.
+        # w / sum(w) in [0, 1]. Both use the weights of the current unroll.
         if weight_count > 1 and weight_sum > 0:
             ess_fraction = weight_sum ** 2 / (weight_count * weight_sq_sum)
             entropy = math.log(weight_sum) - weight_xlogx_sum / weight_sum
@@ -1788,6 +1797,11 @@ class Rater(Algorithm):
             "weight_entropy_normalized": entropy_normalized,
             "batches": recorded_batches,
         }
+        if self.step_diagnostics:
+            self._last_inner_unroll.update(
+                train_seen_samples=weight_count,
+                train_seen_loss=train_loss_sum / max(weight_count, 1),
+                train_seen_accuracy=train_correct / max(weight_count, 1))
 
         return (
             {
@@ -2028,10 +2042,10 @@ class Rater(Algorithm):
         One Rater update with the configured outer objective.
 
         BOTH persistent inner models first complete self.inner_steps batches.
-        train() sets self.inner_steps = len(train_loader), so each inner model
-        sees the entire train_no_aug set once before the Rater update.
+        The default is one full training pass; RATER_INNER_STEPS opts into
+        a shorter budget without restarting the shared training iterator.
 
-        After an inner model finishes its full training pass, its outer
+        After an inner model finishes its configured minibatches, its outer
         per-example CE losses and group ids are collected over the ENTIRE
         outer split, then aggregated using `self.outer_loss_type`.
 
@@ -2049,6 +2063,7 @@ class Rater(Algorithm):
         per_model_outer_stats = []
         per_model_unroll = []
         reference_values = []
+        self._last_inner_step_rows = []
 
         for model_index, inner_model in enumerate(self.inner_models):
             (
@@ -2067,6 +2082,7 @@ class Rater(Algorithm):
             all_outer_losses = []
             all_outer_labels = []
             all_outer_groups = []
+            outer_correct = 0
 
             for z_outer, y_outer, group_outer, _ in val_loader:
                 z_outer = z_outer.to(
@@ -2090,6 +2106,8 @@ class Rater(Algorithm):
                     reduction="none",
                 )
 
+                if self.step_diagnostics:
+                    outer_correct += int(outer_logits.detach().argmax(dim=1).eq(y_outer).sum())
                 all_outer_losses.append(per_outer_loss)
                 all_outer_labels.append(y_outer)
                 all_outer_groups.append(
@@ -2125,6 +2143,17 @@ class Rater(Algorithm):
             unroll_stats = dict(self._last_inner_unroll)
             recorded_batches = unroll_stats.pop("batches")
             per_model_unroll.append(unroll_stats)
+            if self.step_diagnostics:
+                self._last_inner_step_rows.append({
+                    "model": f"inner_{model_index}",
+                    "train_seen_samples": unroll_stats["train_seen_samples"],
+                    "train_seen_loss": unroll_stats["train_seen_loss"],
+                    "train_seen_accuracy": unroll_stats["train_seen_accuracy"],
+                    "outer_samples": int(y_outer_all.numel()),
+                    "outer_loss": float(per_outer_loss.detach().mean()),
+                    "outer_accuracy": outer_correct / max(int(y_outer_all.numel()), 1),
+                    "outer_objective": float(outer_loss.detach()),
+                })
             if self.reference_models:
                 reference_values.append(self._train_uniform_reference(
                     self.reference_models[model_index], recorded_batches, val_loader))
@@ -3049,6 +3078,10 @@ class Rater(Algorithm):
                 "erm_fingerprint": self.erm_checkpoint_fingerprint,
                 "feature_dim": self.feature_dim, "batch_size": self.config.batch_size,
                 "meta_steps": self.meta_steps, "num_inner_models": self.num_inner_models,
+                "inner_batches_per_update": self.inner_steps,
+                "full_epoch_batches": self.full_epoch_batches,
+                "full_train_epoch_before_each_meta_update": self.inner_steps == self.full_epoch_batches,
+                "step_diagnostics": self.step_diagnostics,
                 "inner_lr": self.inner_lr, "outer_lr": self.outer_lr,
                 "inner_reg_weight": self.inner_reg_weight, "grad_clip": self.grad_clip,
                 "capacity": self.rater_capacity, "weighting": self.weighting,
@@ -3075,6 +3108,9 @@ class Rater(Algorithm):
                 "val": "outer calibration split used for the meta objective",
                 "heldout_val": "reserved validation subset, diagnostic-only when available",
                 "test_usage": "diagnostics only; never checkpoint selection",
+                "train_seen_metrics": "unweighted CE and accuracy on visited minibatches, BEFORE each batch update; not whole-train evaluation",
+                "inner_step_outer_metrics": "whole outer split AFTER the inner unroll, BEFORE the rater update",
+                "head_age_batches": "minibatch updates since the head was initialized, including this update",
             },
         }
         _write_json(os.path.join(data_dir, "run_config.json"), self._run_metadata)
@@ -3888,6 +3924,8 @@ class Rater(Algorithm):
             self.feature_model.cpu()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+        self.full_epoch_batches = math.ceil(len(datasets["train"]) / self.config.batch_size)
+        self.inner_steps = self.inner_batch_limit or self.full_epoch_batches
         self._start_artifacts(output_dir, split_names, datasets)
         # ERM record for the splits this run uses (keyed by split name, e.g. val_subset1).
         self._erm_record_data = self._erm_record(by_split, train_split=inner_split)
@@ -3908,11 +3946,11 @@ class Rater(Algorithm):
                                   shuffle=True, num_workers=self.config.num_workers)
         outer_loader = DataLoader(datasets["val"], batch_size=self.config.batch_size,
                                   shuffle=False, num_workers=self.config.num_workers)
-        self.inner_steps = len(train_loader)
         # Keep the original iterator/population initialization order.
         train_iterator, outer_iterator = iter(train_loader), iter(outer_loader)
         self._initialize_inner_population()
-        self._meta_log(f"[Rater] inner={inner_split}; outer={outer_split}; full_inner_steps={self.inner_steps}")
+        self._meta_log(f"[Rater] inner={inner_split}; outer={outer_split}; "
+                       f"inner_batches_per_update={self.inner_steps}; full_epoch_batches={self.full_epoch_batches}")
         uses_groups = self.outer_loss_type in {
             "worst_group_loss", "group_balanced_loss"
         }
@@ -3941,13 +3979,26 @@ class Rater(Algorithm):
                 _atomic_torch_save({**self._checkpoint_payload(0), "best_meta_step": 0,
                                     "best_outer_loss": fresh_value,
                                     "checkpoint_kind": "initial_rater_fresh_head_selection"}, best_path)
-        for step in tqdm(range(1, self.meta_steps + 1), desc="Rater full-epoch meta-training"):
+        head_age_batches = [0] * len(self.inner_models)
+        for step in tqdm(range(1, self.meta_steps + 1), desc="Rater meta-training"):
             refreshed = self._maybe_refresh_inner_models(step)
             # Associate each measured outer loss with the rater that produced it.
             candidate_rater = _cpu_state(self.rater)
             candidate_optimizer = copy.deepcopy(self.outer_optimizer.state_dict())
             _, outer_loss, _, train_iterator, outer_iterator = self._meta_step(
                 train_iterator, outer_iterator, train_loader, outer_loader)
+            if self.step_diagnostics:
+                for index in refreshed:
+                    head_age_batches[index] = 0
+                for index, metrics in enumerate(self._last_inner_step_rows):
+                    head_age_batches[index] += self.inner_steps
+                    _append_csv(_diagnostic_path(output_dir, "inner_step_metrics.csv"), [{
+                        "seed": int(self.config.seed), "step": step,
+                        "inner_batches_per_update": self.inner_steps,
+                        "head_age_batches": head_age_batches[index],
+                        "refreshed": index in refreshed, **metrics,
+                        "rater_grad_norm_preclip": self._last_meta_diagnostics["rater_grad_norm_preclip"],
+                    }])
             if not math.isfinite(outer_loss):
                 raise RuntimeError(f"Nonfinite meta objective at step {step}.")
             should_eval = step == 1 or step % self.eval_freq == 0 or step == self.meta_steps
@@ -4047,7 +4098,9 @@ class Rater(Algorithm):
             "ea_style_gate": "all=RaterRating", "rate_all_samples": True,
             "rater_applied_only_to_misclassified": False,
             "inner_models": self.num_inner_models, "inner_initialization": "independent_random_linear",
-            "full_train_epoch_before_each_meta_update": True, "full_inner_steps": self.inner_steps,
+            "full_train_epoch_before_each_meta_update": self.inner_steps == self.full_epoch_batches,
+            "full_inner_steps": self.inner_steps,  # legacy field: resolved minibatch count
+            "inner_batches_per_update": self.inner_steps, "full_epoch_batches": self.full_epoch_batches,
             "inner_lr": self.inner_lr, "outer_lr": self.outer_lr,
             "erm_model_path": self.erm_model_path, "erm_fingerprint": self.erm_checkpoint_fingerprint,
             "erm_epoch": self.erm_checkpoint_epoch,
@@ -4073,16 +4126,23 @@ class Rater(Algorithm):
             "selection_rule": self.selection_rule, "selected_is_initial_rater": selected_is_initial,
             "compute": compute, "provenance": provenance,
             "calibration_size": len(datasets["val"]),
+            "inner_batches_per_update": self.inner_steps, "full_epoch_batches": self.full_epoch_batches,
+            "full_train_epoch_before_each_meta_update": self.inner_steps == self.full_epoch_batches,
+            "step_diagnostics": self.step_diagnostics,
             "initial_inner_metrics": initial, "selected_inner_metrics": self._selected_inner_metrics,
             "elapsed_seconds": time.monotonic() - self._run_started, "split_names": split_names,
             "notes": ["Only the rater is trained/exported; downstream training is a separate notebook.",
-                      "Each inner model sees a full training epoch before each rater update.",
+                      ("Each inner model sees a full training epoch before each rater update."
+                       if self.inner_steps == self.full_epoch_batches else
+                       f"Each inner model takes {self.inner_steps} minibatch updates before each rater update; a full pass is {self.full_epoch_batches} batches."),
                       "Losses are unweighted mean CE; worst_group_loss is the largest observed group-mean CE.",
                       "Diagnostic weights use fixed ordered batches and are batch-relative.",
                       "Group counts are logged; absent groups are excluded from WGA and worst-group loss.",
                       "Held-out validation and test metrics do not select the rater.",
                       "Selected inner heads match the selected rater's meta step."],
         }
+        if self.step_diagnostics:
+            summary["notes"].append("inner_step_metrics.csv: train_seen metrics are pre-update visited-minibatch averages, not whole-train accuracy; outer metrics use the whole calibration split after the unroll.")
         _write_json(_diagnostic_path(output_dir, "summary.json"), summary)
         if selected_is_initial:
             self._meta_log("[Rater] WARNING: exported rater = initial (untrained) rater; see summary.txt.")
