@@ -528,10 +528,8 @@ class Rater(Algorithm):
                 ),
             )
         )
-        self.inner_steps = int(
-            getattr(self.config, "rater_inner_steps", 2)
-        )
-        # Zero preserves the historical full-pass inner budget.
+        # Minibatches each inner head trains per rater update; 0 = one full training pass.
+        # Resolved to an actual count in train(), once the training loader exists.
         try:
             self.inner_batch_limit = int(os.environ.get("RATER_INNER_STEPS", "0"))
         except ValueError as exc:
@@ -823,8 +821,6 @@ class Rater(Algorithm):
         if min(self.meta_steps, self.eval_freq, self.plot_freq) < 1:
             raise ValueError("Training length and evaluation/plot frequencies must be positive.")
 
-        if self.inner_steps < 1:
-            raise ValueError("rater_inner_steps must be >= 1.")
         if self.num_inner_models < 1:
             raise ValueError("rater_num_inner_models must be >= 1.")
         if self.temperature <= 0:

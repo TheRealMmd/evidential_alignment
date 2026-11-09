@@ -578,16 +578,6 @@ def rater_args(parser):
     )
 
     parser.add_argument(
-        "--rater_inner_steps",
-        type=int,
-        default=2,
-        help=(
-            "number of differentiable inner classifier updates "
-            "performed per meta step"
-        ),
-    )
-
-    parser.add_argument(
         "--rater_num_inner_models",
         type=int,
         default=4,
