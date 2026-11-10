@@ -13,7 +13,7 @@ FeatureRater/
     erm-r50-e100-s0/                ERM backbone 1055b1e8de29 (sheet: Backbone 1)
       waterbirds_erm_resnet50_imagenet_100ep_best_val_acc.pt   + manifest, results, EA feature files (*.npy)
       erm_waterbirds_resnet50_train_128B_100E_seed0_pretrained/   the training run (other checkpoints too)
-      embeddings/waterbirds/resnet50_waterbirds_erm_1055b1e8de29/resolution_224/
+      embeddings/
       raters/<rater run>/           final_rater.pt, logs, plots
         classifiers/<run>/          every final classifier trained with this rater
       controls/<run>/               no-rater classifiers (uniform, random, minority weights, fresh linear)

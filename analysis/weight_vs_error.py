@@ -12,7 +12,7 @@ Outputs (prefix --out):
                      the same for an ERM error set of equal size, and their overlap
   _scatter.png       weight vs ERM loss, coloured by group
 
-  python analysis/weight_vs_error.py --cache-dir <embedding cache>/resolution_224 \
+  python analysis/weight_vs_error.py --cache-dir <ERM_DIR>/embeddings \
       --erm-model <erm.pt> --rater <final_rater.pt> --split train_no_aug --out wve_train
   # the final classifier's own training set (val_subset1 of the notebook split):
   python analysis/weight_vs_error.py ... --split classifier_train --classifier-split-val 0.6 --classifier-split-seed 0

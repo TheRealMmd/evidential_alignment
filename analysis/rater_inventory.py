@@ -33,7 +33,7 @@ def describe(path):
         "selection_rule": rule, "best_meta_step": step, "meta_steps": ckpt.get("meta_steps"),
         "best_outer_loss": ckpt.get("best_outer_loss"), "selected_is_initial_rater": initial,
         "weighting": ckpt.get("weighting"), "temperature": ckpt.get("temperature"),
-        "capacity": ckpt.get("rater_capacity"), "erm_fingerprint": ckpt.get("erm_fingerprint"),
+        "capacity": ckpt.get("rater_capacity"),
         "refresh_every": ckpt.get("refresh_every"), "git_commit": (ckpt.get("provenance") or {}).get("git_commit"),
     }
 

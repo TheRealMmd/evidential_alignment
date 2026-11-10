@@ -2,7 +2,7 @@
 final classifier (per seed; wall clock only), and baselines.
 
   python analysis/collect_compute.py \
-     --embedding-cache <cache>/resolution_224 \
+     --embedding-cache <ERM_DIR>/embeddings \
      --rater-run "FeatureRater=<drive rater run dir>" \
      --exp "FeatureRater classifier=<final-classifier root>" --exp "Uniform=<root>" \
      --baseline "AFR=<baselines>/afr" --baseline "EA=<baselines>/evidential_alignment" \

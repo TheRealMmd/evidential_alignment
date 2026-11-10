@@ -4,7 +4,7 @@ Maps embedding-cache rows back to images through metadata.csv (cache rows follow
 the metadata order of the split; the script checks labels and groups match and
 stops if they do not).
 
-  python analysis/top_bottom_examples.py --cache-dir <embedding cache>/resolution_224 \
+  python analysis/top_bottom_examples.py --cache-dir <ERM_DIR>/embeddings \
       --rater <final_rater.pt> --dataset-dir /content/datasets/waterbird_complete95_forest2water2 \
       --split train_no_aug --n 12 --out top_bottom_train
 """

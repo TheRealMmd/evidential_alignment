@@ -393,55 +393,6 @@ class Rater(Algorithm):
             .clone()
         )
 
-        # Fingerprint the exact checkpoint file so this cache can never be
-        # confused with the old ImageNet-only embedding cache.
-        erm_stat = os.stat(
-            self.erm_model_path
-        )
-
-        fingerprint_text = (
-            f"{os.path.abspath(self.erm_model_path)}|"
-            f"{erm_stat.st_size}|"
-            f"{erm_stat.st_mtime_ns}"
-        )
-
-        self.erm_checkpoint_fingerprint = (
-            hashlib.sha1(
-                fingerprint_text.encode("utf-8")
-            ).hexdigest()[:12]
-        )
-
-        # Optional pin for a checkpoint that was MOVED on Drive. The fingerprint
-        # above includes the file's path, so a moved checkpoint would otherwise
-        # get a new embedding-cache name and its caches would be rebuilt.
-        # RATER_ERM_FINGERPRINT keeps the original name; RATER_ERM_MD5 (optional)
-        # proves the file is the same checkpoint. Unset = previous behaviour.
-        pinned_fingerprint = os.environ.get("RATER_ERM_FINGERPRINT", "").strip().lower()
-        self.erm_fingerprint_pinned = bool(pinned_fingerprint)
-        if pinned_fingerprint:
-            if len(pinned_fingerprint) != 12 or any(
-                ch not in "0123456789abcdef" for ch in pinned_fingerprint
-            ):
-                raise ValueError("RATER_ERM_FINGERPRINT must be 12 hex characters.")
-            expected_md5 = os.environ.get("RATER_ERM_MD5", "").strip().lower()
-            if expected_md5:
-                digest = hashlib.md5()
-                with open(self.erm_model_path, "rb") as fin:
-                    for chunk in iter(lambda: fin.read(1 << 22), b""):
-                        digest.update(chunk)
-                if digest.hexdigest() != expected_md5:
-                    raise ValueError(
-                        "RATER_ERM_MD5 does not match the ERM checkpoint "
-                        f"{self.erm_model_path}; refusing to pin fingerprint "
-                        f"{pinned_fingerprint} to a different file."
-                    )
-            log(
-                f"[Rater] ERM fingerprint pinned to {pinned_fingerprint} "
-                f"(computed from the current path: {self.erm_checkpoint_fingerprint}; "
-                f"md5 {'verified' if expected_md5 else 'not checked'})."
-            )
-            self.erm_checkpoint_fingerprint = pinned_fingerprint
-
         self.feature_model.eval()
 
         for p in self.feature_model.parameters():
@@ -455,8 +406,7 @@ class Rater(Algorithm):
         log(
             f"[Rater] ERM checkpoint epoch="
             f"{self.erm_checkpoint_epoch}, "
-            f"sel_metric={self.erm_checkpoint_sel_metric}, "
-            f"fingerprint={self.erm_checkpoint_fingerprint}"
+            f"sel_metric={self.erm_checkpoint_sel_metric}"
         )
 
         if incompatible.missing_keys:
@@ -486,8 +436,8 @@ class Rater(Algorithm):
         #   RATER_EMBEDDING_CACHE_ROOT=
         #       /content/drive/MyDrive/FeatureRater/waterbirds/<ERM_ID>/embeddings
         #
-        # The Rater automatically creates a representation-specific
-        # namespace under that root. The cache is independent of the
+        # This is the ERM’s one embedding folder, with no extra namespace.
+        # The cache is independent of the
         # timestamped experiment directory, so future runs reuse the same
         # train/val/test embeddings and do not run ResNet-50 again.
         # ----------------------------------------------------
@@ -900,67 +850,13 @@ class Rater(Algorithm):
         token = token.replace(".", "p")
         return token
 
-    def _embedding_cache_namespace(self):
-        """
-        Namespace shared embeddings by the EXACT frozen ERM representation.
-
-        This intentionally differs from the old ImageNet-only cache.
-        """
-        dataset_name = self._safe_cache_token(
-            getattr(
-                self.config,
-                "dataset",
-                "dataset",
-            )
-        )
-
-        backbone_name = self._safe_cache_token(
-            self.config.backbone
-        )
-
-        resolution = self._safe_cache_token(
-            getattr(
-                self.config,
-                "resolution",
-                224,
-            )
-        )
-
-        representation_tag = (
-            f"{backbone_name}_{dataset_name}_erm_"
-            f"{self.erm_checkpoint_fingerprint}"
-        )
-
-        return os.path.join(
-            dataset_name,
-            representation_tag,
-            f"resolution_{resolution}",
-        )
-
     def _resolve_embedding_cache_dir(self, output_dir=None):
-        """
-        Return the embedding directory used by every train/test call.
-
-        If RATER_EMBEDDING_CACHE_ROOT is set, timestamped experiments all
-        share the same tensors. Otherwise fall back to the old per-run cache.
-        """
-        if self.embedding_cache_root:
-            cache_dir = os.path.join(
-                self.embedding_cache_root,
-                self._embedding_cache_namespace(),
+        """Use the ERM's shared embedding folder directly, independent of the run."""
+        if not self.embedding_cache_root:
+            raise ValueError(
+                "Set RATER_EMBEDDING_CACHE_ROOT to the selected ERM's embeddings folder."
             )
-        else:
-            if output_dir is None:
-                raise ValueError(
-                    "No shared embedding cache root was configured and "
-                    "output_dir is None."
-                )
-
-            cache_dir = os.path.join(
-                output_dir,
-                "embedding_cache",
-            )
-
+        cache_dir = self.embedding_cache_root
         os.makedirs(cache_dir, exist_ok=True)
         return cache_dir
 
@@ -985,9 +881,6 @@ class Rater(Algorithm):
             ),
             "erm_checkpoint_path": os.path.abspath(
                 self.erm_model_path
-            ),
-            "erm_checkpoint_fingerprint": (
-                self.erm_checkpoint_fingerprint
             ),
             "erm_checkpoint_epoch": (
                 self.erm_checkpoint_epoch
@@ -1072,12 +965,13 @@ class Rater(Algorithm):
         if actual is None:
             return False
 
-        for key, expected_value in expected.items():
-            # A pinned (moved) checkpoint has a new path by design; the pinned
-            # fingerprint, epoch and the other keys still have to match.
-            if key == "erm_checkpoint_path" and getattr(self, "erm_fingerprint_pinned", False):
-                continue
-            if actual.get(key) != expected_value:
+        # The selected ERM folder owns the features. Check tensor/split structure,
+        # not the checkpoint's path, timestamp, epoch or other origin metadata.
+        keys = ["dataset", "split", "resolution", "feature_dim", "n_classes"]
+        if "subset" in str(split):
+            keys.extend(["split_train", "split_val", "seed"])
+        for key in keys:
+            if actual.get(key) != expected[key]:
                 return False
 
         n = embeddings.shape[0]
@@ -1241,7 +1135,7 @@ class Rater(Algorithm):
             self.erm_head_weight, self.erm_head_bias,
             {name: (d.embeddings, d.y_array, d.group_array) for name, d in datasets_by_name.items()},
             train_split=train_split,
-            checkpoint={"path": self.erm_model_path, "fingerprint": self.erm_checkpoint_fingerprint,
+            checkpoint={"path": self.erm_model_path,
                         "epoch": self.erm_checkpoint_epoch, "sel_metric": self.erm_checkpoint_sel_metric},
         )
 
@@ -3074,7 +2968,6 @@ class Rater(Algorithm):
                 "split_train": getattr(self.config, "split_train", 1.0),
                 "split_val": getattr(self.config, "split_val", 1.0),
                 "num_classes": self.n_classes,
-                "erm_fingerprint": self.erm_checkpoint_fingerprint,
                 "feature_dim": self.feature_dim, "batch_size": self.config.batch_size,
                 "meta_steps": self.meta_steps, "num_inner_models": self.num_inner_models,
                 "inner_batches_per_update": self.inner_steps,
@@ -3312,7 +3205,6 @@ class Rater(Algorithm):
             "rng_state": _rng_state(), "run_metadata": self._run_metadata,
             "feature_dim": self.feature_dim, "num_classes": self.n_classes,
             "erm_model_path": self.erm_model_path,
-            "erm_checkpoint_fingerprint": self.erm_checkpoint_fingerprint,
             "rater_capacity": self.rater_capacity, "rater_weighting": self.weighting,
             "rater_temperature": self.temperature,
         }
@@ -3456,9 +3348,6 @@ class Rater(Algorithm):
         log(f"[Rater] Loaded rater weights from {path} (warm start, not a resumed optimizer run)")
 
     def _validate_checkpoint_representation(self, checkpoint):
-        fingerprint = checkpoint.get("erm_checkpoint_fingerprint", checkpoint.get("erm_fingerprint"))
-        if fingerprint is not None and fingerprint != self.erm_checkpoint_fingerprint:
-            raise ValueError("Checkpoint was trained on a different frozen ERM representation.")
         if checkpoint.get("feature_dim", self.feature_dim) != self.feature_dim:
             raise ValueError("Checkpoint feature dimension does not match the backbone.")
 
@@ -4101,7 +3990,7 @@ class Rater(Algorithm):
             "full_inner_steps": self.inner_steps,  # legacy field: resolved minibatch count
             "inner_batches_per_update": self.inner_steps, "full_epoch_batches": self.full_epoch_batches,
             "inner_lr": self.inner_lr, "outer_lr": self.outer_lr,
-            "erm_model_path": self.erm_model_path, "erm_fingerprint": self.erm_checkpoint_fingerprint,
+            "erm_model_path": self.erm_model_path,
             "erm_epoch": self.erm_checkpoint_epoch,
             "selection_rule": self.selection_rule,
             "selected_is_initial_rater": selected_is_initial,

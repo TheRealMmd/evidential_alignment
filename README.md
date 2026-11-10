@@ -84,16 +84,16 @@ archives/                         dataset tarballs
 waterbirds/<ERM_ID>/              one folder per ERM backbone (e.g. erm-r50-e100-s0)
   <stable ERM checkpoint>.pt      + manifest, results, Evidential Alignment feature files
   erm_..._pretrained/             the ERM training run
-  embeddings/waterbirds/resnet50_waterbirds_erm_<fingerprint>/resolution_224/
+  embeddings/                    train_no_aug.pt, val.pt, test.pt and split files
   raters/<rater run>/             final_rater.pt, logs, plots
     classifiers/<run>/            final classifiers trained with this rater
   controls/<run>/                 no-rater controls (random, constant, minority weights)
   baselines/  analysis/
 unsorted/                         older runs whose ERM or rater is not recorded
 ```
-Each notebook sets `ERM_ID` and falls back to the pre-November paths when the new folders do not
-exist. A moved ERM checkpoint keeps its embedding cache through `RATER_ERM_FINGERPRINT` (+ `RATER_ERM_MD5`),
-set in the Train Rater notebook (`ERM_PINS`).
+Each notebook sets `ERM_ID`: its folder owns one stable `*_best_val_acc.pt` checkpoint and one
+`embeddings/` directory. Rater selection remains independent. Existing nested caches must be moved
+into that directory before use; old experiment records are not rewritten.
 
 ## What each stage saves
 
