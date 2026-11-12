@@ -409,6 +409,18 @@ def training_args(parser):
     )
 
     parser.add_argument(
+        "--split_file",
+        default="",
+        type=str,
+        help=(
+            "JSON file with a saved train/validation row partition "
+            "(see data/data_utils.py: make_partition). When set, "
+            "split_train/split_val < 1 take their rows from this file "
+            "and must match its ratios. Empty = random split as before."
+        ),
+    )
+
+    parser.add_argument(
         "--num_batches",
         default=200,
         type=int,

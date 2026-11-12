@@ -59,6 +59,7 @@ else:
     from .register import register_algorithm
     from models.classifier import Classifier
     from utils import log
+    from data.data_utils import load_partition, partition_sha256
 
 
 METRIC_FIELDS = ("accuracy", "worst_group_accuracy", "loss", "worst_group_loss")
@@ -629,6 +630,18 @@ class Rater(Algorithm):
             )
         ).lower()
 
+        # Optional exact mean weight per batch. Unset (default) keeps the native
+        # transform outputs unchanged: sigmoid weights average about 0.5, softmax
+        # weights sum to 1. A positive value m rescales every batch's weights to
+        # w * m / mean(w) after the transform, so the inner loss carries the same
+        # total weight (m * batch size) for either transform, last batch included.
+        weight_mean_text = os.environ.get("RATER_WEIGHT_MEAN", "").strip()
+        self.weight_mean = float(weight_mean_text) if weight_mean_text else None
+        # How raw scores enter the transform (recorded with the run, not a setting).
+        self.score_normalization = (
+            "batch_centered_raw" if self.weighting == "softmax" else "batch_zscore"
+        )
+
         self.refresh_steps = int(
             getattr(self.config, "rater_refresh_steps", 100)
         )
@@ -780,6 +793,10 @@ class Rater(Algorithm):
             raise ValueError(
                 "rater_weighting must be either 'softmax' or 'sigmoid'."
             )
+        if self.weight_mean is not None and not (
+            math.isfinite(self.weight_mean) and self.weight_mean > 0
+        ):
+            raise ValueError("RATER_WEIGHT_MEAN must be unset or a finite number > 0.")
 
         # Preserve the existing calibration-split behavior and legacy option.
         self.use_calibration_split = bool(
@@ -808,6 +825,11 @@ class Rater(Algorithm):
             f"[Rater] All-sample Rater transform = "
             f"{self.weighting}; temperature = {self.temperature}"
         )
+        if self.weight_mean is not None:
+            log(
+                f"[Rater] Weights rescaled per batch to mean {self.weight_mean:g} "
+                f"(batch weight sum = {self.weight_mean:g} x batch size)."
+            )
         log(
             "[Rater] Every sample uses the Rater rating, "
             "regardless of classifier correctness."
@@ -888,21 +910,46 @@ class Rater(Algorithm):
         }
 
         if "subset" in str(split):
+            split_train, split_val, seed = self._subset_cache_identity()
             metadata.update(
                 {
-                    "split_train": float(
-                        getattr(self.config, "split_train", 1.0)
-                    ),
-                    "split_val": float(
-                        getattr(self.config, "split_val", 1.0)
-                    ),
-                    "seed": int(
-                        getattr(self.config, "seed", 0)
-                    ),
+                    "split_train": float(split_train),
+                    "split_val": float(split_val),
+                    "seed": int(seed),
                 }
             )
+            if self._partition() is not None:
+                metadata["partition_sha256"] = partition_sha256(self._partition())
 
         return metadata
+
+    def _partition(self):
+        """Saved row partition (--split_file), or None for the random split."""
+        split_file = getattr(self.config, "split_file", "") or ""
+        if not split_file:
+            return None
+        if getattr(self, "_loaded_partition", None) is None:
+            self._loaded_partition = load_partition(split_file)
+        return self._loaded_partition
+
+    def _subset_cache_identity(self):
+        """(split_train, split_val, seed) naming subset caches.
+
+        With a saved partition the rows come from the file, so its seed names
+        them; the run's own seed then changes only initialization and order.
+        """
+        partition = self._partition()
+        if partition is not None:
+            return partition["split_train"], partition["split_val"], partition["seed"]
+        return (getattr(self.config, "split_train", 1.0),
+                getattr(self.config, "split_val", 1.0),
+                getattr(self.config, "seed", 0))
+
+    def _partition_source_indices(self, split):
+        """Official-split row positions of a subset split under the saved partition."""
+        kind = "val" if str(split).startswith("val") else "train"
+        key = f"{kind}_indexes{1 if str(split).endswith('subset1') else 2}"
+        return torch.as_tensor(np.asarray(self.datasets[key]), dtype=torch.long)
 
     def _embedding_cache_filename(self, split):
         """
@@ -916,14 +963,9 @@ class Rater(Algorithm):
         safe_split = self._safe_cache_token(split)
 
         if "subset" in str(split):
-            split_train = self._safe_cache_token(
-                getattr(self.config, "split_train", 1.0)
-            )
-            split_val = self._safe_cache_token(
-                getattr(self.config, "split_val", 1.0)
-            )
-            seed = self._safe_cache_token(
-                getattr(self.config, "seed", 0)
+            split_train, split_val, seed = (
+                self._safe_cache_token(value)
+                for value in self._subset_cache_identity()
             )
 
             safe_split = (
@@ -970,6 +1012,8 @@ class Rater(Algorithm):
         keys = ["dataset", "split", "resolution", "feature_dim", "n_classes"]
         if "subset" in str(split):
             keys.extend(["split_train", "split_val", "seed"])
+            if self._partition() is not None:
+                keys.append("partition_sha256")
         for key in keys:
             if actual.get(key) != expected[key]:
                 return False
@@ -1008,11 +1052,24 @@ class Rater(Algorithm):
             return None
 
         if not self._cache_metadata_matches(payload, split):
+            if self._partition() is not None and "subset" in str(split):
+                raise RuntimeError(
+                    f"{cache_file} does not belong to the saved partition "
+                    f"({getattr(self.config, 'split_file', '')}); not overwriting it."
+                )
             log(
                 f"[Rater embeddings] Cache metadata mismatch for "
                 f"split '{split}'. Regenerating it once."
             )
             return None
+
+        if self._partition() is not None and "subset" in str(split):
+            stored = payload.get("source_indices")
+            expected = self._partition_source_indices(split)
+            if stored is None or not torch.equal(torch.as_tensor(stored).long(), expected):
+                raise RuntimeError(
+                    f"{cache_file}: its rows are not the saved partition's {split} rows."
+                )
 
         log(
             f"[Rater embeddings] USING stored embeddings for "
@@ -1106,6 +1163,12 @@ class Rater(Algorithm):
             "attrs": attrs,
             "cache_metadata": self._embedding_cache_metadata(split),
         }
+        if self._partition() is not None and "subset" in str(split):
+            # Official-split row of each cached row, checked on every load.
+            payload["source_indices"] = self._partition_source_indices(split)
+            if len(payload["source_indices"]) != len(labels):
+                raise RuntimeError(f"{split}: {len(labels)} embeddings for "
+                                   f"{len(payload['source_indices'])} partition rows")
 
         tmp_file = cache_file + f".tmp.{os.getpid()}"
         torch.save(payload, tmp_file)
@@ -1314,9 +1377,11 @@ class Rater(Algorithm):
 
     def _scores_to_weights(self, raw_scores):
         """
-        Convert raw Rater outputs into ratings in (0, 1).
+        Convert raw Rater outputs into nonnegative batch weights.
 
-        The transform is applied over every sample in the current batch.
+        Without a target mean, sigmoid ratings are in (0, 1) and softmax
+        weights sum to 1. An optional target mean rescales either transform;
+        rescaled weights may exceed 1. The transform uses the current batch.
         """
 
         if raw_scores.numel() == 0:
@@ -1324,21 +1389,29 @@ class Rater(Algorithm):
 
         if self.weighting == "softmax":
             centered_scores = raw_scores - raw_scores.mean()
-            return torch.softmax(
+            weights = torch.softmax(
                 centered_scores / self.temperature,
                 dim=0,
             )
+        else:
+            score_mean = raw_scores.mean()
+            score_std = raw_scores.std(unbiased=False)
+            standardized_scores = (
+                raw_scores - score_mean
+            ) / (
+                score_std + 1e-6
+            )
+            weights = torch.sigmoid(
+                standardized_scores / self.temperature
+            )
 
-        score_mean = raw_scores.mean()
-        score_std = raw_scores.std(unbiased=False)
-        standardized_scores = (
-            raw_scores - score_mean
-        ) / (
-            score_std + 1e-6
-        )
-        return torch.sigmoid(
-            standardized_scores / self.temperature
-        )
+        if self.weight_mean is not None:
+            # Differentiable rescaling: the meta-gradient flows through mean(w).
+            weights = weights * (
+                self.weight_mean
+                / weights.mean().clamp_min(torch.finfo(weights.dtype).tiny)
+            )
+        return weights
 
     def _all_sample_training_weights(
         self,
@@ -2977,7 +3050,9 @@ class Rater(Algorithm):
                 "inner_lr": self.inner_lr, "outer_lr": self.outer_lr,
                 "inner_reg_weight": self.inner_reg_weight, "grad_clip": self.grad_clip,
                 "capacity": self.rater_capacity, "weighting": self.weighting,
-                "temperature": self.temperature, "outer_loss": self.outer_loss_type,
+                "temperature": self.temperature, "weight_mean": self.weight_mean,
+                "score_normalization": self.score_normalization,
+                "outer_loss": self.outer_loss_type,
                 "outer_top_loss_percent": self.outer_top_loss_percent,
                 "outer_lse_beta": self.outer_lse_beta,
                 "calibration_size": len(datasets["val"]),
@@ -2988,6 +3063,9 @@ class Rater(Algorithm):
                 "fresh_head_epochs": self.fresh_head_epochs if self.fresh_head_eval else None,
                 "outer_split_override": self.outer_split_override or None,
                 "outer_max_samples": self.outer_max_samples or None,
+                "split_file": getattr(self.config, "split_file", "") or None,
+                "partition_sha256": (partition_sha256(self._partition())
+                                     if self._partition() is not None else None),
             },
             "provenance": _source_provenance(),
             "metric_definition": {
@@ -3206,7 +3284,8 @@ class Rater(Algorithm):
             "feature_dim": self.feature_dim, "num_classes": self.n_classes,
             "erm_model_path": self.erm_model_path,
             "rater_capacity": self.rater_capacity, "rater_weighting": self.weighting,
-            "rater_temperature": self.temperature,
+            "rater_temperature": self.temperature, "rater_weight_mean": self.weight_mean,
+            "rater_score_normalization": self.score_normalization,
         }
 
     @_preserve_rng()
@@ -3983,6 +4062,7 @@ class Rater(Algorithm):
             "feature_dim": self.feature_dim, "num_classes": self.n_classes,
             "backbone": self.config.backbone, "rater_capacity": self.rater_capacity,
             "weighting": self.weighting, "temperature": self.temperature,
+            "weight_mean": self.weight_mean, "score_normalization": self.score_normalization,
             "ea_style_gate": "all=RaterRating", "rate_all_samples": True,
             "rater_applied_only_to_misclassified": False,
             "inner_models": self.num_inner_models, "inner_initialization": "independent_random_linear",

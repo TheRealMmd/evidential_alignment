@@ -121,8 +121,15 @@ class ERM(Algorithm):
             "How accurately does the final model classify the training
              examples themselves?"
 
-        train_no_aug answers that question directly.
+        train_no_aug answers that question directly. When the ERM trains on
+        train_subset1 (held-out runs), only those rows are its training rows.
         """
+
+        if (
+            requested_train_split == "train_subset1"
+            and "train_no_aug_subset1" in self.dataloaders
+        ):
+            return "train_no_aug_subset1"
 
         if "train_no_aug" in self.dataloaders:
             return "train_no_aug"
