@@ -197,7 +197,9 @@ def training_args(parser):
         help=(
             "Specify which split of the dataset is used for training. "
             "Default is train. When split_train < 1, this can be "
-            "train_subset1."
+            "train_subset1. The rater also accepts train_subset2 (the rows "
+            "an ERM trained on train_subset1 never saw) and "
+            "train_subset1+train_subset2 (both subsets)."
         ),
     )
 
@@ -575,7 +577,9 @@ def rater_args(parser):
 
             w_i = sigmoid(standardized_i / temperature)
 
-    In both modes, the current Rater implementation uses:
+    or one of the opt-in transforms listed under --rater_weighting.
+
+    In all modes, the current Rater implementation uses:
 
         L_inner = sum_i w_i * CE_i
 
@@ -672,12 +676,23 @@ def rater_args(parser):
         choices=[
             "softmax",
             "sigmoid",
+            "sigmoid_raw",
+            "exp_classwise",
+            "exp_global",
+            "softplus",
         ],
         help=(
             "transform raw Rater scores into inner-loop training "
             "weights. 'softmax' applies batch softmax; 'sigmoid' "
             "standardizes scores within the batch and then applies "
-            "sigmoid"
+            "sigmoid. Opt-in: 'sigmoid_raw' = sigmoid(s/T) without "
+            "standardizing; 'exp_classwise' = exp(s/T) scaled within each "
+            "class so the class keeps (count x target mean) total weight; "
+            "'exp_global' = exp((s - max)/T) scaled to the target mean over "
+            "the batch; 'softplus' = softplus(s/T) scaled to the target mean. "
+            "Target mean = RATER_WEIGHT_MEAN if set, else 0.5. Optional "
+            "RATER_WEIGHT_MAX_RATIO caps each weight at that many times the "
+            "batch (or class) mean. See rater.scores_to_weights"
         ),
     )
 

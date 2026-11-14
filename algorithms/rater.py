@@ -230,6 +230,85 @@ class EmbeddingTensorDataset(Dataset):
         )
 
 
+# ============================================================
+# Score -> weight transforms (shared by rater training and the final-classifier notebook)
+# ============================================================
+
+# softmax and sigmoid are the original transforms; the other four are opt-in.
+RATER_WEIGHTINGS = ("softmax", "sigmoid", "sigmoid_raw", "exp_classwise", "exp_global", "softplus")
+# These four are normalized to a target mean (RATER_WEIGHT_MEAN, else 0.5).
+NORMALIZED_WEIGHTINGS = ("exp_classwise", "exp_global", "softplus")
+
+
+def _cap_weights(weights, max_ratio):
+    """Cap every weight at max_ratio x the mean of these weights, keeping their total."""
+    total = weights.sum()
+    cap = max_ratio * total / weights.numel()
+    capped = torch.zeros_like(weights, dtype=torch.bool)
+    for _ in range(weights.numel()):
+        newly = (weights > cap) & ~capped
+        if not bool(newly.any()):
+            break
+        capped = capped | newly
+        free_total = weights[~capped].sum().clamp_min(torch.finfo(weights.dtype).tiny)
+        weights = torch.where(capped, cap, weights * ((total - cap * capped.sum()) / free_total))
+    return weights
+
+
+def scores_to_weights(scores, weighting, temperature, labels=None, weight_mean=None, max_ratio=None):
+    """Raw rater scores of one set of rows (a minibatch, or a whole training set) -> weights.
+
+    softmax:       softmax((s - mean s) / T); the weights sum to 1.
+    sigmoid:       sigmoid(z / T) with z = s standardized over the rows; mean about 0.5.
+    sigmoid_raw:   sigmoid(s / T), no standardization.
+    exp_classwise: exp(s / T), scaled within each class so the class keeps total weight
+                   (its count) x (target mean). Needs labels.
+    exp_global:    exp((s - max s) / T), scaled so the rows have the target mean.
+    softplus:      softplus(s / T) ("s itself, made positive"), scaled to the target mean.
+    Target mean = weight_mean, or 0.5 when unset. For softmax, sigmoid and sigmoid_raw,
+    weight_mean (if set) rescales the weights to that exact mean.
+    max_ratio (optional, >= 1): cap each weight at max_ratio x the mean weight of its class
+    (exp_classwise) or of all rows (other options), then renormalize to the same total.
+    """
+    if scores.numel() == 0:
+        return scores
+    tiny = torch.finfo(scores.dtype).tiny
+    target = 0.5 if weight_mean is None else float(weight_mean)
+    if weighting == "softmax":
+        weights = torch.softmax((scores - scores.mean()) / temperature, dim=0)
+    elif weighting == "sigmoid":
+        standardized = (scores - scores.mean()) / (scores.std(unbiased=False) + 1e-6)
+        weights = torch.sigmoid(standardized / temperature)
+    elif weighting == "sigmoid_raw":
+        weights = torch.sigmoid(scores / temperature)
+    elif weighting == "exp_global":
+        raw = torch.exp((scores - scores.max()) / temperature)
+        weights = raw * (target * scores.numel() / raw.sum().clamp_min(tiny))
+    elif weighting == "softplus":
+        raw = F.softplus(scores / temperature)
+        weights = raw * (target * scores.numel() / raw.sum().clamp_min(tiny))
+    elif weighting == "exp_classwise":
+        if labels is None:
+            raise ValueError("exp_classwise weighting needs the labels of the rows.")
+        labels = torch.as_tensor(labels, device=scores.device)
+        weights = torch.zeros_like(scores)
+        for label in torch.unique(labels):
+            index = torch.nonzero(labels == label, as_tuple=True)[0]
+            raw = torch.exp((scores[index] - scores[index].max()) / temperature)
+            part = raw * (target * index.numel() / raw.sum().clamp_min(tiny))
+            if max_ratio is not None:
+                part = _cap_weights(part, max_ratio)
+            weights = weights.index_put((index,), part)
+        return weights
+    else:
+        raise ValueError(f"Unknown rater weighting {weighting!r}; choose one of {RATER_WEIGHTINGS}.")
+    if weight_mean is not None and weighting not in NORMALIZED_WEIGHTINGS:
+        weights = weights * (weight_mean / weights.mean().clamp_min(tiny))
+    if max_ratio is not None:
+        weights = _cap_weights(weights, max_ratio)
+    return weights
+
+
 # Rater architectures and the inner classifier live in rater_models.py.
 
 
@@ -637,10 +716,15 @@ class Rater(Algorithm):
         # total weight (m * batch size) for either transform, last batch included.
         weight_mean_text = os.environ.get("RATER_WEIGHT_MEAN", "").strip()
         self.weight_mean = float(weight_mean_text) if weight_mean_text else None
+        # Optional cap (RATER_WEIGHT_MAX_RATIO, unset = no cap): no weight above this many
+        # times the mean weight of its batch (of its class in the batch for exp_classwise).
+        max_ratio_text = os.environ.get("RATER_WEIGHT_MAX_RATIO", "").strip()
+        self.weight_max_ratio = float(max_ratio_text) if max_ratio_text else None
         # How raw scores enter the transform (recorded with the run, not a setting).
-        self.score_normalization = (
-            "batch_centered_raw" if self.weighting == "softmax" else "batch_zscore"
-        )
+        self.score_normalization = {
+            "softmax": "batch_centered_raw", "sigmoid": "batch_zscore", "sigmoid_raw": "raw",
+            "exp_classwise": "class_max_shift", "exp_global": "batch_max_shift", "softplus": "raw",
+        }.get(self.weighting, "unknown")
 
         self.refresh_steps = int(
             getattr(self.config, "rater_refresh_steps", 100)
@@ -789,10 +873,14 @@ class Rater(Algorithm):
         if self.temperature <= 0:
             raise ValueError("rater_temperature must be > 0.")
 
-        if self.weighting not in {"softmax", "sigmoid"}:
+        if self.weighting not in RATER_WEIGHTINGS:
             raise ValueError(
-                "rater_weighting must be either 'softmax' or 'sigmoid'."
+                f"rater_weighting must be one of {RATER_WEIGHTINGS}."
             )
+        if self.weight_max_ratio is not None and not (
+            math.isfinite(self.weight_max_ratio) and self.weight_max_ratio >= 1
+        ):
+            raise ValueError("RATER_WEIGHT_MAX_RATIO must be unset or a finite number >= 1.")
         if self.weight_mean is not None and not (
             math.isfinite(self.weight_mean) and self.weight_mean > 0
         ):
@@ -825,6 +913,8 @@ class Rater(Algorithm):
             f"[Rater] All-sample Rater transform = "
             f"{self.weighting}; temperature = {self.temperature}"
         )
+        if self.weight_max_ratio is not None:
+            log(f"[Rater] Weights capped at {self.weight_max_ratio:g} x the batch (or class) mean.")
         if self.weight_mean is not None:
             log(
                 f"[Rater] Weights rescaled per batch to mean {self.weight_mean:g} "
@@ -1375,17 +1465,23 @@ class Rater(Algorithm):
     # Raw Rater score -> rating transformation
     # ========================================================
 
-    def _scores_to_weights(self, raw_scores):
+    def _scores_to_weights(self, raw_scores, labels=None):
         """
         Convert raw Rater outputs into nonnegative batch weights.
 
         Without a target mean, sigmoid ratings are in (0, 1) and softmax
         weights sum to 1. An optional target mean rescales either transform;
         rescaled weights may exceed 1. The transform uses the current batch.
+        The opt-in transforms and the weight cap use scores_to_weights (labels are
+        needed only by exp_classwise).
         """
 
         if raw_scores.numel() == 0:
             return raw_scores
+
+        if self.weighting not in {"softmax", "sigmoid"} or self.weight_max_ratio is not None:
+            return scores_to_weights(raw_scores, self.weighting, self.temperature, labels=labels,
+                                     weight_mean=self.weight_mean, max_ratio=self.weight_max_ratio)
 
         if self.weighting == "softmax":
             centered_scores = raw_scores - raw_scores.mean()
@@ -1436,7 +1532,7 @@ class Rater(Algorithm):
             raw_scores = raw_scores_all
 
         weights = self._scores_to_weights(
-            raw_scores
+            raw_scores, labels=y
         )
 
         correct_mask = (
@@ -2247,7 +2343,7 @@ class Rater(Algorithm):
                             z = z.to(self.device, non_blocking=True)
                             y = y.to(self.device, non_blocking=True)
                             with torch.no_grad():
-                                weights = self._scores_to_weights(self.rater(z))
+                                weights = self._scores_to_weights(self.rater(z), labels=y)
                             loss = (F.cross_entropy(head(z), y, reduction="none") * weights).sum()
                             if self.inner_reg_weight > 0:
                                 loss = loss + self.inner_reg_weight * sum(
@@ -3051,6 +3147,7 @@ class Rater(Algorithm):
                 "inner_reg_weight": self.inner_reg_weight, "grad_clip": self.grad_clip,
                 "capacity": self.rater_capacity, "weighting": self.weighting,
                 "temperature": self.temperature, "weight_mean": self.weight_mean,
+                "weight_max_ratio": self.weight_max_ratio,
                 "score_normalization": self.score_normalization,
                 "outer_loss": self.outer_loss_type,
                 "outer_top_loss_percent": self.outer_top_loss_percent,
@@ -3285,6 +3382,7 @@ class Rater(Algorithm):
             "erm_model_path": self.erm_model_path,
             "rater_capacity": self.rater_capacity, "rater_weighting": self.weighting,
             "rater_temperature": self.temperature, "rater_weight_mean": self.weight_mean,
+            "rater_weight_max_ratio": self.weight_max_ratio,
             "rater_score_normalization": self.score_normalization,
         }
 
@@ -3317,7 +3415,7 @@ class Rater(Algorithm):
             batch_scores = self.rater(z)
 
             if model is None:
-                batch_final_scores = self._scores_to_weights(batch_scores)
+                batch_final_scores = self._scores_to_weights(batch_scores, labels=y_device)
                 batch_correctness = torch.full(
                     (y_device.shape[0],),
                     float("nan"),
@@ -3473,11 +3571,15 @@ class Rater(Algorithm):
 
             return inner_split, "val"
 
-        if split == "train_subset1":
-            if "train_no_aug_subset1" in self.dataloaders:
-                inner_split = "train_no_aug_subset1"
-            else:
-                inner_split = split
+        if split in {"train_subset1", "train_subset2", "train_subset1+train_subset2"}:
+            # Inner heads train on un-augmented rows, like the default "train".
+            # train_subset2 = the rows the ERM never saw; "+" = both subsets together.
+            parts = [f"train_no_aug_{part[len('train_'):]}" if f"train_no_aug_{part[len('train_'):]}" in self.dataloaders
+                     else part for part in split.split("+")]
+            for part in parts:
+                if part not in self.dataloaders:
+                    raise ValueError(f"--train_split {split} needs --split_train < 1 (no split '{part}').")
+            inner_split = "+".join(parts)
 
             if (
                 self.use_calibration_split
@@ -3854,6 +3956,60 @@ class Rater(Algorithm):
             fig.savefig(os.path.join(plot_dir, filename), dpi=160, bbox_inches="tight")
             plt.close(fig)
 
+    def _partition_rows(self, split):
+        """(official split, set of rows) a split name covers under the saved partition."""
+        rows = {}
+        for part in split.split("+"):
+            kind = "test" if part == "test" else ("val" if part.startswith("val") else "train")
+            if kind == "test":
+                rows.setdefault("test", set()).add(-1)   # the whole test split
+                continue
+            info = self._partition()["splits"][kind]
+            if part.endswith("subset1"):
+                chosen = info["indexes1"]
+            elif part.endswith("subset2"):
+                chosen = info["indexes2"]
+            else:
+                chosen = range(info["n_rows"])
+            rows.setdefault(kind, set()).update(int(i) for i in chosen)
+        return rows
+
+    def _check_partition_roles(self, inner_split, outer_split):
+        """With a saved partition: the inner and outer sets share no row, and neither uses
+        val_subset2 (the final classifier's checkpoint-selection rows) or test."""
+        inner, outer = self._partition_rows(inner_split), self._partition_rows(outer_split)
+        selection = self._partition_rows("val_subset2")["val"]
+        for name, rows in (("inner", inner), ("outer", outer)):
+            if "test" in rows:
+                raise ValueError(f"The rater's {name} set may not use test rows.")
+            if rows.get("val", set()) & selection:
+                raise ValueError(
+                    f"The rater's {name} set ({inner_split if name == 'inner' else outer_split}) uses "
+                    "val_subset2 rows, which the final classifier uses to choose checkpoints.")
+        for kind in ("train", "val"):
+            shared = inner.get(kind, set()) & outer.get(kind, set())
+            if shared:
+                raise ValueError(f"Inner set {inner_split} and outer set {outer_split} share "
+                                 f"{len(shared)} {kind} rows.")
+
+    def _embedding_split_dataset(self, split, cache_dir):
+        """One cached split, or several joined with "+" (rows concatenated in that order)."""
+        parts = split.split("+")
+        datasets = [self._extract_embedding_dataset(part, cache_dir) for part in parts]
+        partition = self._partition()
+        for part, dataset in zip(parts, datasets):
+            # Subset caches are checked row by row when loaded; full caches must have every row.
+            if partition is not None and "subset" not in part and part in ("train_no_aug", "val"):
+                n_rows = partition["splits"]["train" if part == "train_no_aug" else "val"]["n_rows"]
+                if len(dataset) != n_rows:
+                    raise RuntimeError(f"{part}: {len(dataset)} cached rows, the partition has {n_rows}.")
+        if len(datasets) == 1:
+            return datasets[0]
+        return EmbeddingTensorDataset(
+            torch.cat([d.embeddings for d in datasets]), torch.cat([d.y_array for d in datasets]),
+            torch.cat([d.group_array for d in datasets]), torch.cat([d.confounder_array for d in datasets]),
+            sample_indices=torch.cat([d.sample_indices for d in datasets]))
+
     def train(self, output_dir, split="train"):
         """Meta-train only the rater; keep the notebook's training protocol intact."""
         os.makedirs(output_dir, exist_ok=True)
@@ -3864,15 +4020,17 @@ class Rater(Algorithm):
         if self.outer_split_override:
             # e.g. --train_split train_subset1 --split_train 0.8 with
             # RATER_OUTER_SPLIT=train_no_aug_subset2: a skewed, train-like D_meta.
-            if self.outer_split_override in {inner_split, "test"}:
+            if self.outer_split_override in {inner_split, "test"} | set(inner_split.split("+")):
                 raise ValueError("RATER_OUTER_SPLIT must differ from the inner split and from test.")
             outer_split = self.outer_split_override
+        if self._partition() is not None:
+            self._check_partition_roles(inner_split, outer_split)
         split_names = {"train": inner_split, "val": outer_split, "test": "test"}
         if self._has_ea_calibration_split() and "val_subset2" not in split_names.values():
             split_names["heldout_val"] = "val_subset2"
         cache_dir = self._resolve_embedding_cache_dir(output_dir)
         embeddings_started = time.monotonic()
-        by_split = {name: self._extract_embedding_dataset(name, cache_dir)
+        by_split = {name: self._embedding_split_dataset(name, cache_dir)
                     for name in dict.fromkeys(split_names.values())}
         embeddings_seconds = time.monotonic() - embeddings_started
         datasets = {role: by_split[name] for role, name in split_names.items()}
@@ -4063,6 +4221,7 @@ class Rater(Algorithm):
             "backbone": self.config.backbone, "rater_capacity": self.rater_capacity,
             "weighting": self.weighting, "temperature": self.temperature,
             "weight_mean": self.weight_mean, "score_normalization": self.score_normalization,
+            "weight_max_ratio": self.weight_max_ratio,
             "ea_style_gate": "all=RaterRating", "rate_all_samples": True,
             "rater_applied_only_to_misclassified": False,
             "inner_models": self.num_inner_models, "inner_initialization": "independent_random_linear",
