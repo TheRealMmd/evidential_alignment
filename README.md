@@ -49,7 +49,9 @@ pip install -r requirements.txt
 Set each dataset folder in `config.py` (`dataset_paths`). Waterbirds:
 <https://nlp.stanford.edu/data/dro/waterbird_complete95_forest2water2.tar.gz>; CelebA:
 <https://www.kaggle.com/datasets/jessicali9530/celeba-dataset> with the DFR metadata
-(<https://github.com/PolinaKirichenko/deep_feature_reweighting/blob/main/celeba_metadata.csv>);
+(<https://github.com/PolinaKirichenko/deep_feature_reweighting/blob/main/celeba_metadata.csv>),
+or the unpacked Kaggle folder itself under `<celeba folder>/raw/` (no metadata.csv; read by
+`data/celeba.py`). The notebooks take `DATASET = "celeba"` and use the Kaggle archive on Drive;
 CivilComments downloads through `wilds`; MultiNLI via `download` in `data/multinli.py`.
 
 ## Running without notebooks

@@ -129,17 +129,24 @@ def _rows_sha256(filenames):
     return hashlib.sha256(joined.encode("utf-8")).hexdigest()
 
 
-def _official_split_filenames(basedir, split):
+def _official_split_filenames(basedir, split, dataset=None):
     import pandas as pd
-    metadata = pd.read_csv(os.path.join(basedir, "metadata.csv"))
+    metadata_path = os.path.join(basedir, "metadata.csv")
+    if dataset is not None and not os.path.exists(metadata_path):
+        # Datasets without a metadata.csv (CelebA): the rows in the order the
+        # dataset class itself uses, so partition positions index the same rows.
+        from .register import dataset_dict
+        return np.asarray(dataset_dict[dataset](basedir, split).filename_array)
+    metadata = pd.read_csv(metadata_path)
     split_i = ["train", "val", "test"].index(split)
     return metadata[metadata["split"] == split_i]["img_filename"].values
 
 
-def make_partition(basedir, seed, split_train, split_val):
+def make_partition(basedir, seed, split_train, split_val, dataset=None):
     """Fixed partition of the official train and val rows (seeded, label-blind).
 
     subset1 gets int(n * ratio) rows, subset2 the rest; both are stored sorted.
+    dataset is only needed for datasets without a metadata.csv (e.g. "celeba").
     """
     partition = {
         "format": PARTITION_FORMAT,
@@ -151,7 +158,7 @@ def make_partition(basedir, seed, split_train, split_val):
     for split, ratio in (("train", split_train), ("val", split_val)):
         if not 0.0 < float(ratio) < 1.0:
             raise ValueError(f"split_{split} must be in (0, 1) to build a partition, got {ratio}")
-        filenames = _official_split_filenames(basedir, split)
+        filenames = _official_split_filenames(basedir, split, dataset)
         n = len(filenames)
         order = np.random.RandomState(int(seed)).permutation(n)
         k = int(n * float(ratio))

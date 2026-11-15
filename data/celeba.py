@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 
 import numpy as np
@@ -6,6 +7,8 @@ import torch
 
 from PIL import Image
 from torch.utils.data import Dataset
+
+from .register import register_dataset
 
 
 class CelebADataset(Dataset):
@@ -30,6 +33,8 @@ class CelebADataset(Dataset):
     }
 
     n_classes = 2
+    n_places = 2
+    n_groups = 4
 
     def __init__(
         self,
@@ -378,3 +383,15 @@ class CelebADataset(Dataset):
             group,
             attribute,
         )
+
+
+def celeba_dataset(basedir, split="train", transform=None, indexes=None, seed=0):
+    """What `--dataset celeba` builds. A folder with a metadata.csv (the DFR layout) keeps
+    using BiasedDataset, exactly as before; a Kaggle folder with raw/ uses CelebADataset."""
+    if os.path.exists(os.path.join(str(basedir), "metadata.csv")):
+        from .wb_data import BiasedDataset
+        return BiasedDataset(basedir, split, transform, indexes, seed)
+    return CelebADataset(basedir, split, transform, indexes, seed)
+
+
+register_dataset("celeba")(celeba_dataset)
